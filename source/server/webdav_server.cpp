@@ -383,8 +383,6 @@ namespace WebDAVServer
 
         auto* multistatus = doc.NewElement("D:multistatus");
         multistatus->SetAttribute("xmlns:D", "DAV:");
-        // Match common standard custom payload extensions
-        multistatus->SetAttribute("xmlns:Z", "http://example.com");
         doc.InsertEndChild(multistatus);
 
         auto* response = doc.NewElement("D:response");
@@ -1203,25 +1201,27 @@ namespace WebDAVServer
             res.status = 204; // No Content
         });
 
-        svr->CustomRoute("PROPPATCH", R"((.*))", [&](const httplib::Request& req, httplib::Response& res)
+        svr->CustomRoute("PROPPATCH", R"((.*))", [](const Request& req, Response& res)
         {
             auto actions = parse_proppatch(req.body);
-
-            if (actions.empty()) {
-                res.status = 400; // Malformed payload parsing structure state error output
+            if (actions.empty())
+            {
+                res.status = 400; // Bad Request if XML is malformed
+                res.set_content("Malformed or empty XML propertyupdate body.", "text/plain");
                 return;
             }
 
-            // Output parsing debug validation checks directly to system server logs console
-            for (const auto& act : actions)
+            if (is_resource_locked(req.path, req))
             {
-                std::cout << "  -> Action: " << (act.is_remove ? "REMOVE" : "SET")
-                << " | Prefix: [" << act.ns_prefix << "] | Name: [" << act.name
-                << "] | Value: [" << act.value << "]\n";
+                res.status = 423; // Locked
+                res.set_content("Resource is locked. Metadata alterations rejected.", "text/plain");
+                return;
             }
 
-            // Build atomic response execution sequence output maps payload target tracking fields structures
+            // Do nothing with the change and just return success
+
             std::string xml_res = build_proppatch_success_response(req.path, actions);
+
             res.status = 207; // Multi-Status
             res.set_content(xml_res, "text/xml; charset=utf-8");
         });
