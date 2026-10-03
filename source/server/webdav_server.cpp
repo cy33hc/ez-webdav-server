@@ -844,7 +844,7 @@ namespace WebDAVServer
 
             if (read_success)
             {
-                res.status = 200;
+                res.status = 201;
                 res.set_content("Created", "text/plain");
             }
             else
@@ -871,12 +871,14 @@ namespace WebDAVServer
         {
             std::string target = req.path;
             
+            /*
             if (is_resource_locked(req.path, req))
             {
                 res.status = 423; // Locked
                 res.set_content("Resource is locked.", "text/plain");
                 return;
             }
+            */
 
             if (!fs::exists(target))
             {
@@ -929,12 +931,14 @@ namespace WebDAVServer
             fs::path src_path(req.path);
             fs::path dest_path(parse_destination_path(req.get_header_value("Destination")));
 
+            /*
             if (is_resource_locked(dest_path, req))
             {
                 res.status = 423; // Locked
                 res.set_content("Resource is locked.", "text/plain");
                 return;
             }
+            */
 
             if (!fs::exists(src_path))
             {
@@ -1010,12 +1014,14 @@ namespace WebDAVServer
                 return;
             }
 
+            /*
             if (is_resource_locked(req.path, req))
             {
                 res.status = 423; // Locked
                 res.set_content("Resource is locked.", "text/plain");
                 return;
             }
+            */
 
             // Use the request path and destination header directly as system paths
             fs::path src_path(req.path);
@@ -1211,12 +1217,14 @@ namespace WebDAVServer
                 return;
             }
 
+            /*
             if (is_resource_locked(req.path, req))
             {
                 res.status = 423; // Locked
                 res.set_content("Resource is locked. Metadata alterations rejected.", "text/plain");
                 return;
             }
+            */
 
             // Do nothing with the change and just return success
 
