@@ -476,6 +476,46 @@ namespace HttpServer
         return decoded;
     }
 
+    void safe_remove_all(const fs::path& target) {
+        std::error_code ec;
+        if (!fs::exists(target, ec)) return;
+
+        if (fs::is_directory(target, ec)) {
+            std::vector<fs::path> directories_to_delete;
+
+            // 1. Delete all plain files first, and collect directory paths
+            auto it = fs::recursive_directory_iterator(target, 
+                        fs::directory_options::skip_permission_denied, ec);
+            
+            while (!ec && it != fs::recursive_directory_iterator()) {
+                std::error_code item_ec;
+                if (fs::is_directory(it->path(), item_ec)) {
+                    // Keep track of directories to delete later
+                    directories_to_delete.push_back(it->path());
+                } else {
+                    // Delete files immediately
+                    fs::remove(it->path(), item_ec);
+                }
+                it.increment(ec);
+            }
+
+            // 2. Sort directories by length descending (deepest folders first)
+            std::sort(directories_to_delete.begin(), directories_to_delete.end(),
+                    [](const fs::path& a, const fs::path& b) {
+                        return a.string().length() > b.string().length();
+                    });
+
+            // 3. Delete the now-empty subfolders from the bottom up
+            for (const auto& dir : directories_to_delete) {
+                std::error_code remove_ec;
+                fs::remove(dir, remove_ec);
+            }
+        }
+        
+        // 4. Finally, remove the root directory itself
+        fs::remove(target, ec);
+    }
+
     void ServerThread()
     {
         svr->set_socket_options([](socket_t sock)
@@ -785,24 +825,82 @@ namespace HttpServer
             res.status = 204;
         });
 
-        svr->CustomRoute("COPY", R"((.*))", [&](const Request& req, Response& res)
+        svr->CustomRoute("COPY", R"((.*))", [](const Request& req, Response& res)
         {
             if (!req.has_header("Destination")) {
                 res.status = 400;
-                res.set_content("Missing 'Destination' header field payload descriptor.", "text/plain");
+                res.set_content("Missing 'Destination' header.", "text/plain");
                 return;
             }
 
-            std::string dest = req.get_header_value("Destination");
+            // Map paths directly to the FreeBSD filesystem
+            fs::path src_path(req.path);
+            fs::path dest_path(parse_destination_path(req.get_header_value("Destination")));
+
+            // 1. Ensure source file or folder exists
+            if (!fs::exists(src_path)) {
+                res.status = 404; // Not Found
+                res.set_content("Source resource not found.", "text/plain");
+                return;
+            }
+
+            // 2. Evaluate Overwrite Rules
             std::string overwrite = req.has_header("Overwrite") ? req.get_header_value("Overwrite") : "T";
+            bool dest_exists = fs::exists(dest_path);
 
-            std::cout << "WEBDAV [COPY]: " << req.path << " -> " << dest << " (Overwrite: " << overwrite << ")\n";
+            if (dest_exists && overwrite == "F") {
+                res.status = 412; // Precondition Failed
+                res.set_content("Destination exists and Overwrite is False.", "text/plain");
+                return;
+            }
 
-            // Logic Check: Implement file system copy operations here.
-            // Return 412 Precondition Failed if overwrite == "F" and dest file exists.
+            // 3. Ensure the target parent directory exists
+            if (!fs::exists(dest_path.parent_path())) {
+                res.status = 409; // Conflict (Parent collection missing)
+                res.set_content("Conflict: Destination parent collection does not exist.", "text/plain");
+                return;
+            }
 
-            res.status = 201; // Created
-            res.set_header("Content-Length", "0");
+            // 4. Parse Depth Header (WebDAV standard defaults to infinity if missing)
+            std::string depth = req.has_header("Depth") ? req.get_header_value("Depth") : "infinity";
+
+            try {
+                // If overwriting, clear the destination first to ensure a clean copy override
+                if (dest_exists) {
+                    safe_remove_all(dest_path);
+                }
+
+                // Set up our copy configurations based on Depth
+                fs::copy_options options = fs::copy_options::none;
+                if (depth == "infinity") {
+                    options = fs::copy_options::recursive;
+                } else if (depth == "0") {
+                    // If it's a directory, Depth: 0 means create an empty target directory
+                    if (fs::is_directory(src_path)) {
+                        fs::create_directory(dest_path);
+                        std::cout << "[COPY SUCCESS] Created empty collection directory (Depth 0): " << dest_path << "\n";
+                        res.status = dest_exists ? 204 : 201;
+                        res.set_header("Content-Length", "0");
+                        return;
+                    }
+                    // For regular files, Depth 0 acts as a standard single file copy
+                }
+
+                // Perform the system filesystem copy
+                dbglogger_log("copy src_path=%s, dest_path=%s, options=%d", src_path.c_str(), dest_path.c_str(), options);
+                fs::copy(src_path, dest_path, options);
+
+                std::cout << "[COPY SUCCESS] " << src_path << " -> " << dest_path << " (Depth: " << depth << ")\n";
+
+                // WebDAV Spec: 201 if created completely fresh, 204 if an existing resource was overridden
+                res.status = dest_exists ? 204 : 201;
+                res.set_header("Content-Length", "0");
+
+            } catch (const fs::filesystem_error& e) {
+                std::cerr << "[COPY ERROR] Filesystem exception: " << e.what() << "\n";
+                res.status = 500;
+                res.set_content("Internal server error copying resource.", "text/plain");
+            }
         });
 
         svr->CustomRoute("MOVE", R"((.*))", [](const Request& req, Response& res) {
@@ -843,7 +941,7 @@ namespace HttpServer
             try {
                 // Remove target first if overwriting (prevents directory-not-empty failures)
                 if (dest_exists) {
-                    fs::remove_all(dest_path);
+                    safe_remove_all(dest_path);
                 }
 
                 // Perform atomic rename system call on FreeBSD
@@ -862,13 +960,15 @@ namespace HttpServer
                 if (e.code() == std::errc::cross_device_link) {
                     try {
                         fs::copy(src_path, dest_path, fs::copy_options::recursive);
-                        fs::remove_all(src_path);
+                        safe_remove_all(src_path);
                         res.status = dest_exists ? 204 : 201;
                         res.set_header("Content-Length", "0");
                         return;
                     } catch (const std::exception& inner_ex) {
                         res.status = 500;
-                        res.set_content("Cross-device move fallback failed.", "text/plain");
+                        std::stringstream ss;
+                        ss << "Cross-device move fallback failed. Error: " << inner_ex.what();
+                        res.set_content(ss.str(), "text/plain");
                         return;
                     }
                 }
@@ -931,14 +1031,6 @@ namespace HttpServer
             std::string xml_res = build_proppatch_success_response(req.path, actions);
             res.status = 207; // Multi-Status
             res.set_content(xml_res, "text/xml; charset=utf-8");
-        });
-
-        svr->set_error_handler([](const Request & /*req*/, Response &res)
-        {
-            const char *fmt = "<p>Error Status: <span style='color:red;'>%d</span></p>";
-            char buf[BUFSIZ];
-            snprintf(buf, sizeof(buf), fmt, res.status);
-            res.set_content(buf, "text/html");
         });
 
         svr->set_logger([](const Request &req, const Response &res)
