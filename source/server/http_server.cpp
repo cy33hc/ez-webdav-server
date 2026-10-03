@@ -449,6 +449,33 @@ namespace HttpServer
         return printer.CStr();
     }
 
+    std::string parse_destination_path(std::string dest_header) {
+        // 1. Remove scheme and host (e.g., "http://localhost:8080/usr/home/file.txt" -> "/usr/home/file.txt")
+        size_t protocol_pos = dest_header.find("://");
+        if (protocol_pos != std::string::npos) {
+            size_t path_pos = dest_header.find('/', protocol_pos + 3);
+            if (path_pos != std::string::npos) {
+                dest_header = dest_header.substr(path_pos);
+            } else {
+                dest_header = "/";
+            }
+        }
+        
+        // 2. Percent-decode the URI (e.g., convert "%20" back to spaces)
+        std::string decoded;
+        decoded.reserve(dest_header.length());
+        for (size_t i = 0; i < dest_header.length(); ++i) {
+            if (dest_header[i] == '%' && i + 2 < dest_header.length()) {
+                int value = std::stol(dest_header.substr(i + 1, 2), nullptr, 16);
+                decoded += static_cast<char>(value);
+                i += 2;
+            } else {
+                decoded += dest_header[i];
+            }
+        }
+        return decoded;
+    }
+
     void ServerThread()
     {
         svr->set_socket_options([](socket_t sock)
@@ -778,21 +805,77 @@ namespace HttpServer
             res.set_header("Content-Length", "0");
         });
 
-        svr->CustomRoute("MOVE", R"((.*))", [&](const Request& req, Response& res)
-        {
+        svr->CustomRoute("MOVE", R"((.*))", [](const Request& req, Response& res) {
             if (!req.has_header("Destination")) {
                 res.status = 400;
                 res.set_content("Missing 'Destination' header.", "text/plain");
                 return;
             }
 
-            std::string dest = req.get_header_value("Destination");
-            std::cout << "WEBDAV [MOVE]: " << req.path << " -> " << dest << "\n";
+            // Use the request path and destination header directly as system paths
+            fs::path src_path(req.path);
+            fs::path dest_path(parse_destination_path(req.get_header_value("Destination")));
 
-            // Logic Check: Execute atomic relocation sequence here.
+            // 1. Ensure source file/directory exists on the filesystem
+            if (!fs::exists(src_path)) {
+                res.status = 404; 
+                res.set_content("Source resource not found.", "text/plain");
+                return;
+            }
 
-            res.status = 201; // Created
-            res.set_header("Content-Length", "0");
+            // 2. Evaluate Overwrite Rules
+            std::string overwrite = req.has_header("Overwrite") ? req.get_header_value("Overwrite") : "T";
+            bool dest_exists = fs::exists(dest_path);
+
+            if (dest_exists && overwrite == "F") {
+                res.status = 412; // Precondition Failed
+                res.set_content("Destination exists and Overwrite is False.", "text/plain");
+                return;
+            }
+
+            // 3. Ensure the parent directory of the target destination exists
+            if (!fs::exists(dest_path.parent_path())) {
+                res.status = 409; // Conflict (Parent collection missing)
+                res.set_content("Conflict: Destination parent collection does not exist.", "text/plain");
+                return;
+            }
+
+            try {
+                // Remove target first if overwriting (prevents directory-not-empty failures)
+                if (dest_exists) {
+                    fs::remove_all(dest_path);
+                }
+
+                // Perform atomic rename system call on FreeBSD
+                fs::rename(src_path, dest_path);
+
+                std::cout << "[MOVE SUCCESS] " << src_path << " -> " << dest_path << "\n";
+
+                // 201 if created completely fresh, 204 if an existing resource was overwritten
+                res.status = dest_exists ? 204 : 201;
+                res.set_header("Content-Length", "0");
+
+            } catch (const fs::filesystem_error& e) {
+                std::cerr << "[MOVE ERROR] Filesystem exception: " << e.what() << "\n";
+                
+                // Fallback for cross-device links (e.g., moving files across different ZFS datasets or mount points)
+                if (e.code() == std::errc::cross_device_link) {
+                    try {
+                        fs::copy(src_path, dest_path, fs::copy_options::recursive);
+                        fs::remove_all(src_path);
+                        res.status = dest_exists ? 204 : 201;
+                        res.set_header("Content-Length", "0");
+                        return;
+                    } catch (const std::exception& inner_ex) {
+                        res.status = 500;
+                        res.set_content("Cross-device move fallback failed.", "text/plain");
+                        return;
+                    }
+                }
+
+                res.status = 500;
+                res.set_content("Internal server error moving file resource.", "text/plain");
+            }
         });
 
         svr->CustomRoute("LOCK", R"((.*))", [&](const Request& req, Response& res)
