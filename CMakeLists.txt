@@ -23,6 +23,7 @@ target_compile_definitions(${PROJECT_NAME}.elf PRIVATE EZREMOTE_VERSION=${APP_VE
 target_link_libraries(${PROJECT_NAME}.elf
   crypto
   ssl
+  tinyxml2
   SceNotification
   SceSystemService
   SceSysCore

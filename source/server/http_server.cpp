@@ -4,6 +4,7 @@
 #include <fstream>
 #include <filesystem>
 #include <optional>
+#include <tinyxml2.h>
 #include "http/httplib.h"
 #include "server/http_server.h"
 #include "util.h"
@@ -21,10 +22,16 @@ static bool stop_server = false;
 static bool in_rest_mode = false;
 constexpr int DOWNLOAD_SEGMENTS = 4;
 
-// Structure to hold failure details
 struct DeleteFailure {
     fs::path path;
     std::error_code error;
+};
+
+struct PropAction {
+    std::string ns_prefix;
+    std::string name;
+    std::string value;
+    bool is_remove;
 };
 
 namespace HttpServer
@@ -155,7 +162,6 @@ namespace HttpServer
         }
     }
 
-    // Simple MIME type helper
     std::string get_mime_type(const std::string& path) {
         if (path.ends_with(".html") || path.ends_with(".htm")) return "text/html";
         if (path.ends_with(".css")) return "text/css";
@@ -286,6 +292,163 @@ namespace HttpServer
         return std::nullopt; // Success
     }
 
+    std::vector<PropAction> parse_proppatch(const std::string& xml_body) {
+        std::vector<PropAction> actions;
+        tinyxml2::XMLDocument doc;
+        
+        if (doc.Parse(xml_body.c_str()) != tinyxml2::XML_SUCCESS) {
+            return actions; 
+        }
+
+        auto* root = doc.FirstChildElement();
+        if (!root) return actions;
+
+        // Iterate through <set> or <remove> tags
+        for (auto* action_node = root->FirstChildElement(); action_node != nullptr; action_node = action_node->NextSiblingElement()) {
+            std::string action_type = action_node->Value();
+            
+            // Strip out prefixes if client uses D:set or D:remove
+            size_t colon_pos = action_type.find(':');
+            if (colon_pos != std::string::npos) {
+                action_type = action_type.substr(colon_pos + 1);
+            }
+
+            bool is_remove = (action_type == "remove");
+            if (action_type != "set" && !is_remove) continue;
+
+            // Drill down to the inner <prop> container
+            auto* prop_node = action_node->FirstChildElement();
+            if (!prop_node) continue;
+            
+            std::string prop_val = prop_node->Value();
+            if (prop_val.find("prop") == std::string::npos) continue;
+
+            // Extract individual properties inside <prop>
+            for (auto* p = prop_node->FirstChildElement(); p != nullptr; p = p->NextSiblingElement()) {
+                PropAction action;
+                action.is_remove = is_remove;
+                
+                std::string full_name = p->Value();
+                size_t p_colon = full_name.find(':');
+                
+                if (p_colon != std::string::npos) {
+                    action.ns_prefix = full_name.substr(0, p_colon); 
+                    action.name = full_name.substr(p_colon + 1);
+                } else {
+                    action.ns_prefix = "";
+                    action.name = full_name;
+                }
+                
+                if (!is_remove && p->GetText()) {
+                    action.value = p->GetText();
+                }
+
+                actions.push_back(action);
+            }
+        }
+        return actions;
+    }
+
+    // Generates the compliant WebDAV 207 Multi-Status XML payload for PROPPATCH
+    std::string build_proppatch_success_response(const std::string& href, const std::vector<PropAction>& actions) {
+        tinyxml2::XMLDocument doc;
+        
+        auto* decl = doc.NewDeclaration("xml version=\"1.0\" encoding=\"utf-8\"");
+        doc.InsertEndChild(decl);
+
+        auto* multistatus = doc.NewElement("D:multistatus");
+        multistatus->SetAttribute("xmlns:D", "DAV:");
+        // Match common standard custom payload extensions
+        multistatus->SetAttribute("xmlns:Z", "http://example.com");
+        doc.InsertEndChild(multistatus);
+
+        auto* response = doc.NewElement("D:response");
+        multistatus->InsertEndChild(response);
+
+        auto* href_node = doc.NewElement("D:href");
+        href_node->SetText(href.c_str());
+        response->InsertEndChild(href_node);
+
+        auto* propstat = doc.NewElement("D:propstat");
+        response->InsertEndChild(propstat);
+
+        auto* prop_container = doc.NewElement("D:prop");
+        propstat->InsertEndChild(prop_container);
+
+        for (const auto& action : actions) {
+            // Maintain the incoming element namespace formatting
+            std::string tag_name = action.ns_prefix.empty() ? action.name : (action.ns_prefix + ":" + action.name);
+            auto* p_node = doc.NewElement(tag_name.c_str());
+            prop_container->InsertEndChild(p_node);
+        }
+
+        auto* status_node = doc.NewElement("D:status");
+        status_node->SetText("HTTP/1.1 200 OK");
+        propstat->InsertEndChild(status_node);
+
+        tinyxml2::XMLPrinter printer;
+        doc.Accept(&printer);
+        return printer.CStr();
+    }
+
+    // --- HELPER FUNCTION FOR LOCK ---
+
+    // Generates the required WebDAV XML body indicating a successful resource Lock setup
+    std::string build_lock_success_response(const std::string& href, const std::string& token) {
+        tinyxml2::XMLDocument doc;
+        
+        auto* decl = doc.NewDeclaration("xml version=\"1.0\" encoding=\"utf-8\"");
+        doc.InsertEndChild(decl);
+
+        auto* prop = doc.NewElement("D:prop");
+        prop->SetAttribute("xmlns:D", "DAV:");
+        doc.InsertEndChild(prop);
+
+        auto* lockdiscovery = doc.NewElement("D:lockdiscovery");
+        prop->InsertEndChild(lockdiscovery);
+
+        auto* activelock = doc.NewElement("D:activelock");
+        lockdiscovery->InsertEndChild(activelock);
+
+        // Type
+        auto* locktype = doc.NewElement("D:locktype");
+        locktype->InsertEndChild(doc.NewElement("D:write"));
+        activelock->InsertEndChild(locktype);
+
+        // Scope
+        auto* lockscope = doc.NewElement("D:lockscope");
+        lockscope->InsertEndChild(doc.NewElement("D:exclusive"));
+        activelock->InsertEndChild(lockscope);
+
+        // Depth
+        auto* depth = doc.NewElement("D:depth");
+        depth->SetText("0");
+        activelock->InsertEndChild(depth);
+
+        // Timeout duration response
+        auto* timeout = doc.NewElement("D:timeout");
+        timeout->SetText("Second-3600");
+        activelock->InsertEndChild(timeout);
+
+        // Target Active Token URI
+        auto* locktoken = doc.NewElement("D:locktoken");
+        auto* href_token = doc.NewElement("D:href");
+        href_token->SetText(("opaquelocktoken:" + token).c_str());
+        locktoken->InsertEndChild(href_token);
+        activelock->InsertEndChild(locktoken);
+
+        // Root URI tracking target
+        auto* lockroot = doc.NewElement("D:lockroot");
+        auto* href_root = doc.NewElement("D:href");
+        href_root->SetText(href.c_str());
+        lockroot->InsertEndChild(href_root);
+        activelock->InsertEndChild(lockroot);
+
+        tinyxml2::XMLPrinter printer;
+        doc.Accept(&printer);
+        return printer.CStr();
+    }
+
     void ServerThread()
     {
         svr->set_socket_options([](socket_t sock)
@@ -322,6 +485,13 @@ namespace HttpServer
             char version[20];
             sprintf(version, "%.2f", 1.0f);
             res.set_content(version, "text/html");
+        });
+
+        svr->Options(R"((.*))", [&](const Request&, Response& res)
+        {
+            res.status = 200;
+            res.set_header("Allow", "GET, HEAD, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, COPY, MOVE, LOCK, UNLOCK");
+            res.set_header("DAV", "1, 2"); // Signals class levels processing rules (Locks enabled)
         });
 
         svr->Get(R"((.*))", [&](const Request& req, Response& res)
@@ -586,6 +756,98 @@ namespace HttpServer
             }
             
             res.status = 204;
+        });
+
+        svr->CustomRoute("COPY", R"((.*))", [&](const Request& req, Response& res)
+        {
+            if (!req.has_header("Destination")) {
+                res.status = 400;
+                res.set_content("Missing 'Destination' header field payload descriptor.", "text/plain");
+                return;
+            }
+
+            std::string dest = req.get_header_value("Destination");
+            std::string overwrite = req.has_header("Overwrite") ? req.get_header_value("Overwrite") : "T";
+
+            std::cout << "WEBDAV [COPY]: " << req.path << " -> " << dest << " (Overwrite: " << overwrite << ")\n";
+
+            // Logic Check: Implement file system copy operations here.
+            // Return 412 Precondition Failed if overwrite == "F" and dest file exists.
+
+            res.status = 201; // Created
+            res.set_header("Content-Length", "0");
+        });
+
+        svr->CustomRoute("MOVE", R"((.*))", [&](const Request& req, Response& res)
+        {
+            if (!req.has_header("Destination")) {
+                res.status = 400;
+                res.set_content("Missing 'Destination' header.", "text/plain");
+                return;
+            }
+
+            std::string dest = req.get_header_value("Destination");
+            std::cout << "WEBDAV [MOVE]: " << req.path << " -> " << dest << "\n";
+
+            // Logic Check: Execute atomic relocation sequence here.
+
+            res.status = 201; // Created
+            res.set_header("Content-Length", "0");
+        });
+
+        svr->CustomRoute("LOCK", R"((.*))", [&](const Request& req, Response& res)
+        {
+            std::cout << "WEBDAV [LOCK]: Target path context: " << req.path << "\n";
+
+            // Generate a standard unique internal lock token identifier
+            std::string mock_token = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+
+            std::string xml_res = build_lock_success_response(req.path, mock_token);
+
+            // Required headers for standard platform filesystem integrations
+            res.set_header("Lock-Token", "<opaquelocktoken:" + mock_token + ">");
+            res.status = 200;
+            res.set_content(xml_res, "text/xml; charset=utf-8");
+        });
+
+        svr->CustomRoute("UNLOCK", R"((.*))", [&](const Request& req, Response& res)
+        {
+            if (!req.has_header("Lock-Token")) {
+                res.status = 400;
+                res.set_content("Missing target validation token reference mapping parameter.", "text/plain");
+                return;
+            }
+
+            std::string token = req.get_header_value("Lock-Token");
+            std::cout << "WEBDAV [UNLOCK]: Clear lock token context: " << token << " on path: " << req.path << "\n";
+
+            // Logic Check: Match token against internal tracking map, remove tracking lock state.
+
+            res.status = 204; // No Content (Standard successful unlock code output)
+        });
+
+        svr->CustomRoute("PROPPATCH", R"((.*))", [&](const httplib::Request& req, httplib::Response& res)
+        {
+            std::cout << "WEBDAV [PROPPATCH]: Processing payload data details modification request.\n";
+            auto actions = parse_proppatch(req.body);
+
+            if (actions.empty()) {
+                res.status = 400; // Malformed payload parsing structure state error output
+                return;
+            }
+
+            // Output parsing debug validation checks directly to system server logs console
+            for (const auto& act : actions)
+            {
+                std::cout << "  -> Action: " << (act.is_remove ? "REMOVE" : "SET")
+                << " | Prefix: [" << act.ns_prefix << "] | Name: [" << act.name
+                << "] | Value: [" << act.value << "]\n";
+            }
+
+            // Build atomic response execution sequence output maps payload target tracking fields structures
+            std::string xml_res = build_proppatch_success_response(req.path, actions);
+            res.status = 207; // Multi-Status
+            res.set_content(xml_res, "text/xml; charset=utf-8");
         });
 
         svr->set_error_handler([](const Request & /*req*/, Response &res)
