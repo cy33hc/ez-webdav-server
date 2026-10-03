@@ -296,13 +296,11 @@ namespace HttpServer
             if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, 
                         reinterpret_cast<const char*>(&send_buf_size), 
                         sizeof(send_buf_size)) < 0) {
-                dbglogger_log("Warning: Failed to maximize socket send buffer.");
             }
 
             if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, 
                         reinterpret_cast<const char*>(&send_buf_size), 
                         sizeof(send_buf_size)) < 0) {
-                dbglogger_log("Warning: Failed to maximize socket send buffer.");
             }
 
             // Optional: Disable Nagle's algorithm to eliminate tiny TCP pack delay cycles
@@ -429,7 +427,6 @@ namespace HttpServer
                     size_t bytes_remaining = length;
                     std::vector<char> buffer(0x100000);
 
-                    dbglogger_log("8");
                     while (total_read < total_to_read)
                     {
                         size_t bytes_to_read = std::min(bytes_remaining, buffer.size());
@@ -522,7 +519,6 @@ namespace HttpServer
                 file.write(data, data_length);
 
                 total_received_bytes += data_length;
-                dbglogger_log("Received chunk: %llu bytes. Total so far: %llu bytes", data_length, total_received_bytes);
                 return true;
             });
 
@@ -530,13 +526,11 @@ namespace HttpServer
 
             if (read_success)
             {
-                dbglogger_log("Upload completed successfully! Total size: %llu bytes", total_received_bytes);
                 res.status = 200;
                 res.set_content("Created", "text/plain");
             }
             else
             {
-                dbglogger_log("Upload interrupted or client disconnected early.");
                 res.status = 400;
                 res.set_content("Bad Request: Stream interrupted", "text/plain");
             }
@@ -607,7 +601,7 @@ namespace HttpServer
             dbglogger_log("%s", log(req, res).c_str());
         });
        
-        svr->set_payload_max_length(1024 * 1024 * 12);
+        svr->set_payload_max_length(500ULL * 1024 * 1024 * 1024);
         svr->set_tcp_nodelay(true);
 
         svr->listen("0.0.0.0", http_server_port);
