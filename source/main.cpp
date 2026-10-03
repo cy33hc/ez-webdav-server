@@ -12,7 +12,7 @@
 #include "server/webdav_server.h"
 #include "sceSystemService.h"
 #include "util.h"
-#include "dbglogger.h"
+// #include "dbglogger.h"
 
 static bool in_rest_mode = false;
 static bool stop_monitoring = false;
@@ -57,12 +57,12 @@ static void *SystemEventThread(void *argp)
 
 int main(int argc, char *argv[])
 {
-    dbglogger_init();
-    dbglogger_log("If you see this you've set up dbglogger correctly.");
+    // dbglogger_init();
+    // dbglogger_log("If you see this you've set up dbglogger correctly.");
 
     if (WebDAVServer::IsStarted())
     {
-        Util::Notify("ezRemote Server already started");
+        Util::Notify("WebDAV Server already started");
         return 0;
     }
 
@@ -72,7 +72,7 @@ int main(int argc, char *argv[])
 
     WebDAVServer::Start();
     stop_monitoring = true;
-    Util::Notify("ezRemote Server stopped.");
+    Util::Notify("WebDAV Server stopped.");
 
     return 0;
 }

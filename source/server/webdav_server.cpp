@@ -8,7 +8,7 @@
 #include "http/httplib.h"
 #include "server/webdav_server.h"
 #include "util.h"
-#include "dbglogger.h"
+// #include "dbglogger.h"
 
 using namespace httplib;
 namespace fs = std::filesystem;
@@ -114,13 +114,13 @@ namespace WebDAVServer
         std::time_t tt = std::chrono::system_clock::to_time_t(sct);
         std::tm gmt = *std::gmtime(&tt);
         
-        std::stringstream ss;
+        std::ostringstream ss;
         ss << std::put_time(&gmt, "%a, %d %b %Y %H:%M:%S GMT");
         return ss.str();
     }
 
     std::string urlEncodePath(const std::string& value) {
-        std::stringstream escaped;
+        std::ostringstream escaped;
         escaped << std::hex << std::uppercase;
 
         for (char c : value) {
@@ -152,7 +152,7 @@ namespace WebDAVServer
         return ss.str();
     }
 
-    void append_resource_xml(std::stringstream& xml, const std::string& href_path, const fs::path& local_path)
+    void append_resource_xml(std::ostringstream& xml, const std::string& href_path, const fs::path& local_path)
     {
         std::error_code ec;
         bool is_dir = fs::is_directory(local_path, ec);
@@ -191,7 +191,7 @@ namespace WebDAVServer
         xml << "    </D:response>\n";
     }
 
-    void append_recursive_contents(std::stringstream& xml, const std::string& parent_href, const fs::path& local_path)
+    void append_recursive_contents(std::ostringstream& xml, const std::string& parent_href, const fs::path& local_path)
     {
         std::error_code ec;
         for (const auto& entry : fs::directory_iterator(local_path, fs::directory_options::skip_permission_denied, ec))
@@ -406,103 +406,61 @@ namespace WebDAVServer
         return actions;
     }
 
-    // Generates the compliant WebDAV 207 Multi-Status XML payload for PROPPATCH
     std::string build_proppatch_success_response(const std::string& href, const std::vector<PropAction>& actions)
     {
-        tinyxml2::XMLDocument doc;
-        
-        auto* decl = doc.NewDeclaration("xml version=\"1.0\" encoding=\"utf-8\"");
-        doc.InsertEndChild(decl);
+        std::ostringstream xml;
 
-        auto* multistatus = doc.NewElement("D:multistatus");
-        multistatus->SetAttribute("xmlns:D", "DAV:");
-        doc.InsertEndChild(multistatus);
-
-        auto* response = doc.NewElement("D:response");
-        multistatus->InsertEndChild(response);
-
-        auto* href_node = doc.NewElement("D:href");
-        href_node->SetText(href.c_str());
-        response->InsertEndChild(href_node);
-
-        auto* propstat = doc.NewElement("D:propstat");
-        response->InsertEndChild(propstat);
-
-        auto* prop_container = doc.NewElement("D:prop");
-        propstat->InsertEndChild(prop_container);
+        xml << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
+        xml << "<D:multistatus xmlns:D=\"DAV:\">\n";
+        xml << "  <D:response>\n";
+        xml << "    <D:href>" << urlEncodePath(href) << "</D:href>\n";
+        xml << "    <D:propstat>\n";
+        xml << "      <D:prop>\n";
 
         for (const auto& action : actions)
         {
-            // Maintain the incoming element namespace formatting
             std::string tag_name = action.ns_prefix.empty() ? action.name : (action.ns_prefix + ":" + action.name);
-            auto* p_node = doc.NewElement(tag_name.c_str());
-            prop_container->InsertEndChild(p_node);
+            std::string safe_tag = escapeXmlText(tag_name);
+            xml << "        <" << safe_tag << "/>\n";
         }
 
-        auto* status_node = doc.NewElement("D:status");
-        status_node->SetText("HTTP/1.1 200 OK");
-        propstat->InsertEndChild(status_node);
+        xml << "      </D:prop>\n";
+        xml << "      <D:status>HTTP/1.1 200 OK</D:status>\n";
+        xml << "    </D:propstat>\n";
+        xml << "  </D:response>\n";
+        xml << "</D:multistatus>";
 
-        tinyxml2::XMLPrinter printer;
-        doc.Accept(&printer);
-        return printer.CStr();
+        return xml.str();
     }
 
-    // Generates the required WebDAV XML body indicating a successful resource Lock setup
     std::string build_lock_success_response(const std::string& href, const std::string& token)
     {
-        tinyxml2::XMLDocument doc;
-        
-        auto* decl = doc.NewDeclaration("xml version=\"1.0\" encoding=\"utf-8\"");
-        doc.InsertEndChild(decl);
+        std::ostringstream xml;
 
-        auto* prop = doc.NewElement("D:prop");
-        prop->SetAttribute("xmlns:D", "DAV:");
-        doc.InsertEndChild(prop);
+        xml << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
+        xml << "<D:prop xmlns:D=\"DAV:\">\n";
+        xml << "  <D:lockdiscovery>\n";
+        xml << "    <D:activelock>\n";
+        xml << "      <D:locktype>\n";
+        xml << "        <D:write/>\n";
+        xml << "      </D:locktype>\n";
+        xml << "      <D:lockscope>\n";
+        xml << "        <D:exclusive/>\n";
+        xml << "      </D:lockscope>\n";
+        xml << "      <D:depth>0</D:depth>\n";
+        xml << "      <D:timeout>Second-3600</D:timeout>\n";
+        std::string full_token_uri = "opaquelocktoken:" + token;
+        xml << "      <D:locktoken>\n";
+        xml << "        <D:href>" << escapeXmlText(urlEncodePath(full_token_uri)) << "</D:href>\n";
+        xml << "      </D:locktoken>\n";
+        xml << "      <D:lockroot>\n";
+        xml << "        <D:href>" << escapeXmlText(urlEncodePath(href)) << "</D:href>\n";
+        xml << "      </D:lockroot>\n";
+        xml << "    </D:activelock>\n";
+        xml << "  </D:lockdiscovery>\n";
+        xml << "</D:prop>";
 
-        auto* lockdiscovery = doc.NewElement("D:lockdiscovery");
-        prop->InsertEndChild(lockdiscovery);
-
-        auto* activelock = doc.NewElement("D:activelock");
-        lockdiscovery->InsertEndChild(activelock);
-
-        // Type
-        auto* locktype = doc.NewElement("D:locktype");
-        locktype->InsertEndChild(doc.NewElement("D:write"));
-        activelock->InsertEndChild(locktype);
-
-        // Scope
-        auto* lockscope = doc.NewElement("D:lockscope");
-        lockscope->InsertEndChild(doc.NewElement("D:exclusive"));
-        activelock->InsertEndChild(lockscope);
-
-        // Depth
-        auto* depth = doc.NewElement("D:depth");
-        depth->SetText("0");
-        activelock->InsertEndChild(depth);
-
-        // Timeout duration response
-        auto* timeout = doc.NewElement("D:timeout");
-        timeout->SetText("Second-3600");
-        activelock->InsertEndChild(timeout);
-
-        // Target Active Token URI
-        auto* locktoken = doc.NewElement("D:locktoken");
-        auto* href_token = doc.NewElement("D:href");
-        href_token->SetText(("opaquelocktoken:" + token).c_str());
-        locktoken->InsertEndChild(href_token);
-        activelock->InsertEndChild(locktoken);
-
-        // Root URI tracking target
-        auto* lockroot = doc.NewElement("D:lockroot");
-        auto* href_root = doc.NewElement("D:href");
-        href_root->SetText(href.c_str());
-        lockroot->InsertEndChild(href_root);
-        activelock->InsertEndChild(lockroot);
-
-        tinyxml2::XMLPrinter printer;
-        doc.Accept(&printer);
-        return printer.CStr();
+        return xml.str();
     }
 
     bool is_resource_locked(const std::string& path, const Request& req)
@@ -534,7 +492,7 @@ namespace WebDAVServer
         static std::random_device rd;
         static std::mt19937 gen(rd());
         std::uniform_int_distribution<> dis(0, 15);
-        std::stringstream ss;
+        std::ostringstream ss;
         ss << std::hex;
         for (int i = 0; i < 32; ++i)
         {
@@ -820,7 +778,7 @@ namespace WebDAVServer
                 depth = req.get_header_value("Depth");
             }
 
-            std::stringstream xml;
+            std::ostringstream xml;
             xml << "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n";
             xml << "<D:multistatus xmlns:D=\"DAV:\">\n";
 
@@ -1023,8 +981,6 @@ namespace WebDAVServer
                     // For regular files, Depth 0 acts as a standard single file copy
                 }
 
-                // Perform the system filesystem copy
-                dbglogger_log("copy src_path=%s, dest_path=%s, options=%d", src_path.c_str(), dest_path.c_str(), options);
                 fs::copy(src_path, dest_path, options);
 
                 res.status = dest_exists ? 204 : 201;
@@ -1033,7 +989,6 @@ namespace WebDAVServer
             }
             catch (const fs::filesystem_error& e)
             {
-                std::cerr << "[COPY ERROR] Filesystem exception: " << e.what() << "\n";
                 res.status = 500;
                 res.set_content("Internal server error copying resource.", "text/plain");
             }
@@ -1102,9 +1057,6 @@ namespace WebDAVServer
             }
             catch (const fs::filesystem_error& e)
             {
-                std::cerr << "[MOVE ERROR] Filesystem exception: " << e.what() << "\n";
-                
-                // Fallback for cross-device links (e.g., moving files across different ZFS datasets or mount points)
                 if (e.code() == std::errc::cross_device_link)
                 {
                     try
@@ -1118,7 +1070,7 @@ namespace WebDAVServer
                     catch (const std::exception& inner_ex)
                     {
                         res.status = 500;
-                        std::stringstream ss;
+                        std::ostringstream ss;
                         ss << "Cross-device move fallback failed. Error: " << inner_ex.what();
                         res.set_content(ss.str(), "text/plain");
                         return;
@@ -1267,10 +1219,12 @@ namespace WebDAVServer
             res.set_content(xml_res, "text/xml; charset=utf-8");
         });
 
+        /*
         svr->set_logger([](const Request &req, const Response &res)
         {
             dbglogger_log("%s", log(req, res).c_str());
         });
+        */
 
         // Support upto 500GB of file upload
         svr->set_payload_max_length(500ULL * 1024 * 1024 * 1024);
