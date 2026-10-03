@@ -319,6 +319,10 @@ using socklen_t = int;
 
 #else // not _WIN32
 
+#ifdef __PS4__
+typedef unsigned int u_int;
+#endif
+
 #include <arpa/inet.h>
 #if !defined(_AIX) && !defined(__MVS__)
 #include <ifaddrs.h>

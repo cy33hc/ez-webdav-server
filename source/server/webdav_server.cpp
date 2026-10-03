@@ -38,7 +38,7 @@ struct WebDavLock
 };
 
 Server *svr;
-int http_server_port = 6702;
+int http_server_port = 8880;
 static bool stop_server = false;
 static bool in_rest_mode = false;
 constexpr int DOWNLOAD_SEGMENTS = 4;
