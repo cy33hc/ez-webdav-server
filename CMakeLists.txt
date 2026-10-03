@@ -13,12 +13,12 @@ include_directories(
 
 add_executable(${PROJECT_NAME}.elf
   source/http/httplib.cpp
-  source/server/http_server.cpp
+  source/server/webdav_server.cpp
   source/dbglogger.c
   source/main.cpp
 )
 
-target_compile_definitions(${PROJECT_NAME}.elf PRIVATE EZREMOTE_VERSION=${APP_VERSION} CPPHTTPLIB_THREAD_POOL_COUNT=64 CPPHTTPLIB_OPENSSL_SUPPORT=1 CPPHTTPLIB_NO_ACCEPT4)
+target_compile_definitions(${PROJECT_NAME}.elf PRIVATE APP_VERSION=${APP_VERSION} CPPHTTPLIB_THREAD_POOL_COUNT=64 CPPHTTPLIB_OPENSSL_SUPPORT=1 CPPHTTPLIB_NO_ACCEPT4)
 
 target_link_libraries(${PROJECT_NAME}.elf
   crypto

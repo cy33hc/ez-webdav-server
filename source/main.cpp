@@ -9,7 +9,7 @@
 #include <unistd.h>
 #include <pthread.h>
 
-#include "server/http_server.h"
+#include "server/webdav_server.h"
 #include "sceSystemService.h"
 #include "util.h"
 #include "dbglogger.h"
@@ -32,7 +32,7 @@ static void *SystemEventThread(void *argp)
                 if (!in_rest_mode)
                 {
                     in_rest_mode = true;
-                    HttpServer::SetRestMode(in_rest_mode);
+                    WebDAVServer::SetRestMode(in_rest_mode);
                     Util::Notify("ezRemote: Pausing downloads for rest mode");
                 }
                 break;
@@ -41,7 +41,7 @@ static void *SystemEventThread(void *argp)
                 if (in_rest_mode)
                 {
                     in_rest_mode = false;
-                    HttpServer::SetRestMode(in_rest_mode);
+                    WebDAVServer::SetRestMode(in_rest_mode);
                     Util::Notify("ezRemote: Resuming downloads");
                 }
                 break;
@@ -60,7 +60,7 @@ int main(int argc, char *argv[])
     dbglogger_init();
     dbglogger_log("If you see this you've set up dbglogger correctly.");
 
-    if (HttpServer::IsStarted())
+    if (WebDAVServer::IsStarted())
     {
         Util::Notify("ezRemote Server already started");
         return 0;
@@ -70,7 +70,7 @@ int main(int argc, char *argv[])
     pthread_t sys_event_thread;
     pthread_create(&sys_event_thread, NULL, SystemEventThread, NULL);
 
-    HttpServer::Start();
+    WebDAVServer::Start();
     stop_monitoring = true;
     Util::Notify("ezRemote Server stopped.");
 

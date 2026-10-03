@@ -5,7 +5,7 @@
 
 using namespace httplib;
 
-namespace HttpServer
+namespace WebDAVServer
 {
     void ServerThread();
     void Start();
