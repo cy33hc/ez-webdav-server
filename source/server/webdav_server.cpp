@@ -119,6 +119,39 @@ namespace WebDAVServer
         return ss.str();
     }
 
+    std::string urlEncodePath(const std::string& value) {
+        std::stringstream escaped;
+        escaped << std::hex << std::uppercase;
+
+        for (char c : value) {
+            // Keep alphanumeric characters and expected path delimiters untouched
+            if (std::isalnum(static_cast<unsigned char>(c)) || 
+                c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+                escaped << c;
+            } else {
+                // Percent-encode everything else (spaces, ampersands, exclamation marks, etc.)
+                escaped << '%' << std::setw(2) << std::setfill('0') 
+                        << static_cast<int>(static_cast<unsigned char>(c));
+            }
+        }
+        return escaped.str();
+    }
+
+    std::string escapeXmlText(const std::string& unsafe) {
+        std::ostringstream ss;
+        for (char c : unsafe) {
+            switch (c) {
+                case '&':  ss << "&amp;";  break;
+                case '<':  ss << "&lt;";   break;
+                case '>':  ss << "&gt;";   break;
+                case '"':  ss << "&quot;"; break;
+                case '\'': ss << "&apos;"; break;
+                default:   ss << c;        break;
+            }
+        }
+        return ss.str();
+    }
+
     void append_resource_xml(std::stringstream& xml, const std::string& href_path, const fs::path& local_path)
     {
         std::error_code ec;
@@ -126,12 +159,12 @@ namespace WebDAVServer
         if (ec) return; // Prevent parsing if structural errors occur
         
         xml << "    <D:response>\n";
-        xml << "        <D:href>" << href_path << (is_dir && href_path.back() != '/' ? "/" : "") << "</D:href>\n";
+        xml << "        <D:href>" << urlEncodePath(href_path) << (is_dir && href_path.back() != '/' ? "/" : "") << "</D:href>\n";
         xml << "        <D:propstat>\n";
         xml << "            <D:prop>\n";
         
         std::string filename = local_path == "/" ? "" : local_path.filename().string();
-        xml << "                <D:displayname>" << filename << "</D:displayname>\n";
+        xml << "                <D:displayname>" << escapeXmlText(filename) << "</D:displayname>\n";
         
         if (is_dir) {
             xml << "                <D:resourcetype><D:collection/></D:resourcetype>\n";
@@ -884,7 +917,7 @@ namespace WebDAVServer
             {
                 res.status = 207;
                 res.set_content(R"(
-                    <D:multistatus xmlns:D="DAV:"><D:response><D:href>)" + target +
+                    <D:multistatus xmlns:D="DAV:"><D:response><D:href>)" + urlEncodePath(target) +
                     R"(</D:href><D:status>HTTP/1.1 404 Not Found</D:status></D:response></D:multistatus>)", "application/xml; charset=\"utf-8\"");
                 return;
             }
@@ -893,7 +926,7 @@ namespace WebDAVServer
             {
                 res.status = 207;
                 std::ostringstream ss;
-                ss << R"(<D:multistatus xmlns:D="DAV:"><D:response><D:href>)" << failure->path << R"(</D:href><D:status>HTTP/1.1 )";
+                ss << R"(<D:multistatus xmlns:D="DAV:"><D:response><D:href>)" << urlEncodePath(failure->path) << R"(</D:href><D:status>HTTP/1.1 )";
                 if (failure->error == std::errc::permission_denied)
                 {
                     ss <<  "403 Forbidden";
