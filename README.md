@@ -26,7 +26,7 @@ You should see a message on the screen "WebDAV Server Starting XXX on port 8880"
  - RClone **(Recommeded)**<br/>
    Rclone can do the same thing as Windows Explorer, where it can mount the WebDAV Server as a Network Drive.
 
-   - First create a repo config for WebDAV.
+   - First create a remote config for WebDAV.
      - Execute `rclone.exe config`
        1. Select "n) New remote"
        2. Give the remote a custom name. example "PS5"
