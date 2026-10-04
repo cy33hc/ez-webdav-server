@@ -5,11 +5,15 @@ This is a customized WebDAV Server for the PS4/PS5. It implements Class 1 and fa
 ## Why implement a WebDAV Server?
  - On Windows/Linux/MacOS you can mount WebDAV Server onto the laptop/desktop and directly work with the files on the PS4/PS5 as if they are local on the laptop/desktop.
 
-## Installation
+## How to Start WebDAV
  - On PS5, send the webdav-server-ps5.elf to the elfloader on port 9021
  - On PS4, send the webdav-server-ps4.elf to Goldhen binloader
 
 You should see a message on the screen "WebDAV Server Starting XXX on port 8880"
+
+## How to Stop WebDAV
+ - Execute `curl http://<PS5_IP>:8880/stop` or paste the URL into the firefox/Chrome address bar
+ - You should see the message "WebDAV Server Stopped" on the PS5/PS4
 
 ## How to mount the WebDAV server on the laptop/desktop
 
