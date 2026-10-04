@@ -4,6 +4,8 @@
 #include <fstream>
 #include <filesystem>
 #include <optional>
+#include <fcntl.h>
+#include <unistd.h>
 #include <tinyxml2.h>
 #include "http/httplib.h"
 #include "server/webdav_server.h"
@@ -847,7 +849,6 @@ namespace WebDAVServer
         svr->Put(R"((.*))", [&](const Request &req, Response &res, const ContentReader &content_reader)
         {
             std::string target_path = req.path;
-
             size_t range_start = 0, range_end = 0, total_file_size = 0;
             bool has_range = req.has_header("Content-Range");
 
@@ -857,46 +858,88 @@ namespace WebDAVServer
                 parse_content_range(content_range, range_start, range_end, total_file_size);
             }
 
-            std::ofstream ofs(target_path, std::ios::binary | std::ios::in | std::ios::out);
-            if (!ofs)
+            int flags = O_WRONLY;
+            if (req.body.empty() || req.get_header_value("Content-Length") == "0")
             {
-                ofs.open(target_path, std::ios::binary | std::ios::out);
+                flags |= O_CREAT | O_TRUNC;
+            }
+            else
+            {
+                flags |= (access(target_path.c_str(), F_OK) == 0) ? O_RDWR : O_CREAT;
             }
 
-            if (!ofs)
+            int fd = open(target_path.c_str(), flags, 0666);
+            if (fd < 0)
             {
                 res.status = 500;
-                res.set_content("Internal Server Error: Unable to open file", "text/plain");
                 return;
             }
 
+            if (range_start > 0 && lseek(fd, range_start, SEEK_SET) < 0)
+            {
+                close(fd);
+                res.status = 500;
+                return;
+            }
+
+            const size_t TARGET_CHUNK_SIZE = 1024 * 1024; // 1 Megabyte
+            std::vector<char> upload_accumulator;
+            upload_accumulator.reserve(TARGET_CHUNK_SIZE);
+
             bool write_success = content_reader([&](const char* data, size_t data_length)
             {
-                ofs.seekp(range_start);
-                ofs.write(data, data_length);
-                
-                range_start += data_length; 
+                upload_accumulator.insert(upload_accumulator.end(), data, data + data_length);
+
+                if (upload_accumulator.size() >= TARGET_CHUNK_SIZE)
+                {
+                    size_t total_written = 0;
+                    size_t to_write = upload_accumulator.size();
+                    const char* ptr = upload_accumulator.data();
+
+                    while (total_written < to_write)
+                    {
+                        ssize_t bytes_written = write(fd, ptr + total_written, to_write - total_written);
+                        if (bytes_written < 0)
+                        {
+                            return false; // Physical write error encounter
+                        }
+                        total_written += bytes_written;
+                    }
+                    
+                    upload_accumulator.clear();
+                }
                 return true;
             });
-            ofs.close();
+
+            if (write_success && !upload_accumulator.empty())
+            {
+                size_t total_written = 0;
+                size_t to_write = upload_accumulator.size();
+                const char* ptr = upload_accumulator.data();
+
+                while (total_written < to_write)
+                {
+                    ssize_t bytes_written = write(fd, ptr + total_written, to_write - total_written);
+                    if (bytes_written < 0)
+                    {
+                        write_success = false;
+                        break;
+                    }
+                    total_written += bytes_written;
+                }
+            }
+
+            fsync(fd); 
+            close(fd);
 
             if (write_success)
             {
-                if (has_range)
-                {
-                    res.status = 206; // Partial Content
-                    res.set_content("Chunk uploaded successfully", "text/plain");
-                }
-                else
-                {
-                    res.status = 201; // Created
-                    res.set_content("File uploaded successfully", "text/plain");
-                }
+                res.status = has_range ? 206 : 201;
+                res.set_content("Success", "text/plain");
             }
             else
             {
                 res.status = 400;
-                res.set_content("Bad Request: Stream interrupted", "text/plain");
             }
         });
 
