@@ -579,6 +579,23 @@ namespace WebDAVServer
         fs::remove(target, ec);
     }
 
+    bool parse_content_range(const std::string& header, size_t& start, size_t& end, size_t& total)
+    {
+        std::regex regex(R"(bytes\s+(\d+)-(\d+)/(\d+|\*))");
+        std::smatch match;
+        if (std::regex_match(header, match, regex)) {
+            start = std::stoull(match[1].str());
+            end = std::stoull(match[2].str());
+            if (match[3].str() != "*") {
+                total = std::stoull(match[3].str());
+            } else {
+                total = 0;
+            }
+            return true;
+        }
+        return false;
+    }
+
     void ServerThread()
     {
         svr->set_socket_options([](socket_t sock)
@@ -618,8 +635,13 @@ namespace WebDAVServer
         svr->Options(R"((.*))", [&](const Request&, Response& res)
         {
             res.status = 200;
+            res.set_header("Accept-Ranges", "bytes");
             res.set_header("Allow", "GET, HEAD, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, COPY, MOVE, LOCK, UNLOCK");
             res.set_header("DAV", "1, 2"); // Signals class levels processing rules (Locks enabled)
+
+            // simulate NextCloud to enable rclone streaming
+            res.set_header("X-LFV", "1");
+            res.set_header("OC-API-Version", "1.0");
         });
 
         svr->Get(R"((.*))", [&](const Request& req, Response& res)
@@ -710,6 +732,13 @@ namespace WebDAVServer
                 file.close();
 
                 res.set_header("Accept-Ranges", "bytes");
+
+                if (req.method == "HEAD")
+                {
+                    res.status = 200;
+                    res.set_header("Content-Length", std::to_string(file_size)); 
+                    return;
+                }
 
                 if (!req.has_header("Range"))
                 {
@@ -808,35 +837,61 @@ namespace WebDAVServer
             res.status = 207; // Multi-Status
             res.set_content(xml.str(), "application/xml; charset=utf-8");
             res.set_header("DAV", "1, 2");
+            res.set_header("Accept-Ranges", "bytes");
+
+            // simulate NextCloud
+            res.set_header("X-LFV", "1");
+            res.set_header("OC-API-Version", "1.0");
         });
 
         svr->Put(R"((.*))", [&](const Request &req, Response &res, const ContentReader &content_reader)
         {
             std::string target_path = req.path;
-            
-            std::ofstream file(target_path, std::ios::binary);
-            if (!file.is_open())
+
+            size_t range_start = 0, range_end = 0, total_file_size = 0;
+            bool has_range = req.has_header("Content-Range");
+
+            if (has_range)
             {
-                res.status = 500; // Internal Server Error
-                res.set_content("Internal Server Error: Cannot write to disk", "text/plain");
+                std::string content_range = req.get_header_value("Content-Range");
+                parse_content_range(content_range, range_start, range_end, total_file_size);
+            }
+
+            std::ofstream ofs(target_path, std::ios::binary | std::ios::in | std::ios::out);
+            if (!ofs)
+            {
+                ofs.open(target_path, std::ios::binary | std::ios::out);
+            }
+
+            if (!ofs)
+            {
+                res.status = 500;
+                res.set_content("Internal Server Error: Unable to open file", "text/plain");
                 return;
-            } 
+            }
 
-            uint64_t total_received_bytes = 0;
-            bool read_success = content_reader([&](const char *data, size_t data_length)
+            bool write_success = content_reader([&](const char* data, size_t data_length)
             {
-                file.write(data, data_length);
-
-                total_received_bytes += data_length;
+                ofs.seekp(range_start);
+                ofs.write(data, data_length);
+                
+                range_start += data_length; 
                 return true;
             });
+            ofs.close();
 
-            file.close();
-
-            if (read_success)
+            if (write_success)
             {
-                res.status = 201;
-                res.set_content("Created", "text/plain");
+                if (has_range)
+                {
+                    res.status = 206; // Partial Content
+                    res.set_content("Chunk uploaded successfully", "text/plain");
+                }
+                else
+                {
+                    res.status = 201; // Created
+                    res.set_content("File uploaded successfully", "text/plain");
+                }
             }
             else
             {
