@@ -26,7 +26,7 @@ You should see a message on the screen "WebDAV Server Starting XXX on port 8880"
        2. Give the remote a custom name. example "PS5"
        3. Select "63 / WebDAV"
        4. Enter the URL. Example: "http://<PS5_IP>:8880"
-       5. Select "3 / Owncloud 10 PHP based WebDAV server"
+       5. Select "3 / Owncloud 10 PHP based WebDAV server". **MUST SELECT 3. I've found this is the only setup that doesn't use caching***
        6. Leave the username, password, bearer_token  Empty
        7. Select "No" for adavanced config
        8. Select "Yes" to save
