@@ -40,7 +40,7 @@ You should see a message on the screen "WebDAV Server Starting XXX on port 8880"
 
    - Run the following command to mount the network drive. In my example, I've choose the "Z:" drive
      - Create a mount_ps5.bat file and put the following into the file<br/>
-       `rclone mount PS5:/ Z: --network-mode --vfs-cache-mode off --dir-cache-time 5s`
+       `rclone mount PS5:/ Z: --vfs-cache-mode off --dir-cache-time 5s`
      - Execute the mount_ps5.bat. If successfull, you should see the "Z:" drive mounted
 
 ### Linux
