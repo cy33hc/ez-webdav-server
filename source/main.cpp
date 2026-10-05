@@ -10,13 +10,17 @@
 #include <pthread.h>
 
 #include "server/webdav_server.h"
+#ifndef PLATFORM_WSL
 #include "sceSystemService.h"
+#endif
 #include "util.h"
 // #include "dbglogger.h"
 
+#ifndef PLATFORM_WSL
 static bool in_rest_mode = false;
 static bool stop_monitoring = false;
 
+// Console-only: watch for sleep/resume to pause and resume transfers.
 static void *SystemEventThread(void *argp)
 {
     SceSystemServiceEvent event;
@@ -54,6 +58,7 @@ static void *SystemEventThread(void *argp)
 
     return nullptr;
 }
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -66,12 +71,16 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    // Start system event monitoring thread
+#ifndef PLATFORM_WSL
+    // Start system event monitoring thread (console sleep/resume handling).
     pthread_t sys_event_thread;
     pthread_create(&sys_event_thread, NULL, SystemEventThread, NULL);
+#endif
 
     WebDAVServer::Start();
+#ifndef PLATFORM_WSL
     stop_monitoring = true;
+#endif
     Util::Notify("WebDAV Server stopped.");
 
     return 0;

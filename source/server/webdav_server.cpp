@@ -4,8 +4,12 @@
 #include <fstream>
 #include <filesystem>
 #include <optional>
+#include <functional>
+#include <vector>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <cerrno>
 #include <tinyxml2.h>
 #include "http/httplib.h"
 #include "server/webdav_server.h"
@@ -29,6 +33,25 @@ struct PropAction
     bool is_remove;
 };
 
+struct RequestedProp
+{
+    std::string ns_prefix;
+    std::string name;
+};
+
+enum class PropFindMode
+{
+    AllProp,
+    PropName,
+    Prop
+};
+
+struct PropFindRequest
+{
+    PropFindMode mode = PropFindMode::AllProp;
+    std::vector<RequestedProp> props;
+};
+
 struct WebDavLock
 {
     std::string path;
@@ -37,7 +60,12 @@ struct WebDavLock
     std::string scope;
     std::string owner;
     int depth;
+    std::chrono::steady_clock::time_point expiry; // when this lock lapses
 };
+
+#ifndef LOCK_TIMEOUT_SECONDS
+#define LOCK_TIMEOUT_SECONDS 3600
+#endif
 
 Server *svr;
 int http_server_port = 8880;
@@ -45,8 +73,8 @@ static bool stop_server = false;
 static bool in_rest_mode = false;
 constexpr int DOWNLOAD_SEGMENTS = 4;
 
-std::map<std::string, WebDavLock> g_path_to_lock; // Key: file system path
-std::map<std::string, std::string> g_token_to_path; // Key: lock token
+std::map<std::string, WebDavLock> g_path_to_lock;
+std::map<std::string, std::string> g_token_to_path;
 std::mutex g_lock_mutex;
 
 namespace WebDAVServer
@@ -121,17 +149,62 @@ namespace WebDAVServer
         return ss.str();
     }
 
-    std::string urlEncodePath(const std::string& value) {
+    std::string format_http_date(std::time_t tt)
+    {
+        std::tm gmt = *std::gmtime(&tt);
+        std::ostringstream ss;
+        ss << std::put_time(&gmt, "%a, %d %b %Y %H:%M:%S GMT");
+        return ss.str();
+    }
+
+    std::string format_iso8601_date(fs::file_time_type file_time)
+    {
+        auto sct = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+            file_time - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
+        );
+        std::time_t tt = std::chrono::system_clock::to_time_t(sct);
+        std::tm gmt = *std::gmtime(&tt);
+
+        std::ostringstream ss;
+        ss << std::put_time(&gmt, "%Y-%m-%dT%H:%M:%SZ");
+        return ss.str();
+    }
+
+    std::string compute_etag(const fs::path& local_path, bool /*is_dir*/)
+    {
+        struct stat st;
+        if (::stat(local_path.c_str(), &st) != 0)
+        {
+            return "W/\"0-0\"";
+        }
+
+        unsigned long long dev   = static_cast<unsigned long long>(st.st_dev);
+        unsigned long long ino   = static_cast<unsigned long long>(st.st_ino);
+        unsigned long long size  = static_cast<unsigned long long>(st.st_size);
+        long long          sec   = static_cast<long long>(st.st_mtim.tv_sec);
+        long               nsec  = static_cast<long>(st.st_mtim.tv_nsec);
+
+        std::ostringstream ss;
+        ss << "W/\"" << std::hex
+           << dev << '-' << ino << '-' << size << '-' << sec << '-' << nsec
+           << '"';
+        return ss.str();
+    }
+
+    std::string urlEncodePath(const std::string& value)
+    {
         std::ostringstream escaped;
         escaped << std::hex << std::uppercase;
 
-        for (char c : value) {
-            // Keep alphanumeric characters and expected path delimiters untouched
+        for (char c : value)
+        {
             if (std::isalnum(static_cast<unsigned char>(c)) || 
-                c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+                c == '-' || c == '_' || c == '.' || c == '~' || c == '/')
+            {
                 escaped << c;
-            } else {
-                // Percent-encode everything else (spaces, ampersands, exclamation marks, etc.)
+            }
+            else
+            {
                 escaped << '%' << std::setw(2) << std::setfill('0') 
                         << static_cast<int>(static_cast<unsigned char>(c));
             }
@@ -139,61 +212,292 @@ namespace WebDAVServer
         return escaped.str();
     }
 
-    std::string escapeXmlText(const std::string& unsafe) {
-        std::ostringstream ss;
-        for (char c : unsafe) {
-            switch (c) {
-                case '&':  ss << "&amp;";  break;
-                case '<':  ss << "&lt;";   break;
-                case '>':  ss << "&gt;";   break;
-                case '"':  ss << "&quot;"; break;
-                case '\'': ss << "&apos;"; break;
-                default:   ss << c;        break;
+    mode_t put_create_mode(const fs::path& p)
+    {
+        std::string ext = p.extension().string();
+        for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (ext == ".bin" || ext == ".elf" || ext == ".prx" || ext == ".sprx" || ext == ".self")
+        {
+            return 0777;
+        }
+        return 0666;
+    }
+
+    std::string guess_content_type(const fs::path& local_path)
+    {
+        auto ext = local_path.extension();
+        if (ext == ".txt") return "text/plain";
+        if (ext == ".html" || ext == ".htm") return "text/html";
+        if (ext == ".css") return "text/css";
+        if (ext == ".js") return "application/javascript";
+        if (ext == ".png") return "image/png";
+        if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+        return "application/octet-stream";
+    }
+
+    void purge_expired_locks()
+    {
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = g_path_to_lock.begin(); it != g_path_to_lock.end(); )
+        {
+            if (it->second.expiry <= now)
+            {
+                g_token_to_path.erase(it->second.token);
+                it = g_path_to_lock.erase(it);
+            }
+            else
+            {
+                ++it;
             }
         }
-        return ss.str();
     }
 
-    void append_resource_xml(std::ostringstream& xml, const std::string& href_path, const fs::path& local_path)
+    long lock_seconds_remaining(const WebDavLock& lk)
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (lk.expiry <= now) return 0;
+        return static_cast<long>(
+            std::chrono::duration_cast<std::chrono::seconds>(lk.expiry - now).count());
+    }
+
+    void build_lockdiscovery(tinyxml2::XMLElement* lockdiscovery, const std::string& fs_path)
+    {
+        tinyxml2::XMLDocument* doc = lockdiscovery->GetDocument();
+
+        std::lock_guard<std::mutex> guard(g_lock_mutex);
+        purge_expired_locks();
+        auto it = g_path_to_lock.find(fs_path);
+        if (it == g_path_to_lock.end())
+        {
+            return; // No active lock (or it just expired): leave empty.
+        }
+
+        const WebDavLock& lk = it->second;
+
+        auto* activelock = doc->NewElement("D:activelock");
+        lockdiscovery->InsertEndChild(activelock);
+
+        auto* locktype = doc->NewElement("D:locktype");
+        locktype->InsertEndChild(doc->NewElement("D:write"));
+        activelock->InsertEndChild(locktype);
+
+        auto* lockscope = doc->NewElement("D:lockscope");
+        lockscope->InsertEndChild(doc->NewElement(lk.scope == "shared" ? "D:shared" : "D:exclusive"));
+        activelock->InsertEndChild(lockscope);
+
+        auto* depth = doc->NewElement("D:depth");
+        depth->SetText(lk.depth);
+        activelock->InsertEndChild(depth);
+
+        if (!lk.owner.empty())
+        {
+            auto* owner = doc->NewElement("D:owner");
+            owner->SetText(lk.owner.c_str());
+            activelock->InsertEndChild(owner);
+        }
+
+        auto* timeout = doc->NewElement("D:timeout");
+        timeout->SetText(("Second-" + std::to_string(lock_seconds_remaining(lk))).c_str());
+        activelock->InsertEndChild(timeout);
+
+        auto* locktoken = doc->NewElement("D:locktoken");
+        auto* token_href = doc->NewElement("D:href");
+        token_href->SetText(lk.token.c_str());
+        locktoken->InsertEndChild(token_href);
+        activelock->InsertEndChild(locktoken);
+    }
+
+    struct ResolvedProp
+    {
+        std::string name; // e.g. "D:getetag"
+        std::function<void(tinyxml2::XMLElement*)> fill;
+    };
+
+    ResolvedProp text_prop(std::string name, std::string value)
+    {
+        return ResolvedProp{std::move(name), [v = std::move(value)](tinyxml2::XMLElement* el)
+        {
+            el->SetText(v.c_str());
+        }};
+    }
+
+    std::vector<ResolvedProp> collect_live_properties(const std::string& href_path, const fs::path& local_path, bool is_dir)
     {
         std::error_code ec;
-        bool is_dir = fs::is_directory(local_path, ec);
-        if (ec) return; // Prevent parsing if structural errors occur
-        
-        xml << "    <D:response>\n";
-        xml << "        <D:href>" << urlEncodePath(href_path) << (is_dir && href_path.back() != '/' ? "/" : "") << "</D:href>\n";
-        xml << "        <D:propstat>\n";
-        xml << "            <D:prop>\n";
-        
-        std::string filename = local_path == "/" ? "" : local_path.filename().string();
-        xml << "                <D:displayname>" << escapeXmlText(filename) << "</D:displayname>\n";
-        
-        if (is_dir) {
-            xml << "                <D:resourcetype><D:collection/></D:resourcetype>\n";
-            xml << "                <D:getcontenttype>httpd/unix-directory</D:getcontenttype>\n";
-        } else {
-            xml << "                <D:resourcetype/>\n";
-            
-            uintmax_t size = fs::file_size(local_path, ec);
-            xml << "                <D:getcontentlength>" << (!ec ? size : 0) << "</D:getcontentlength>\n";
-            
-            if (local_path.extension() == ".txt") xml << "                <D:getcontenttype>text/plain</D:getcontenttype>\n";
-            else if (local_path.extension() == ".html") xml << "                <D:getcontenttype>text/html</D:getcontenttype>\n";
-            else xml << "                <D:getcontenttype>application/octet-stream</D:getcontenttype>\n";
+        std::vector<ResolvedProp> props;
+
+        std::string filename = local_path.filename().string();
+        if (filename.empty())
+        {
+            std::string h = href_path;
+            if (h.size() > 1 && h.back() == '/') h.pop_back();
+            size_t slash = h.find_last_of('/');
+            filename = (slash == std::string::npos) ? h : h.substr(slash + 1);
         }
-        
-        auto write_time = fs::last_write_time(local_path, ec);
-        if (!ec) {
-            xml << "                <D:getlastmodified>" << format_http_date(write_time) << "</D:getlastmodified>\n";
+        props.push_back(text_prop("D:displayname", filename));
+
+        if (is_dir)
+        {
+            props.push_back(ResolvedProp{"D:resourcetype", [](tinyxml2::XMLElement* el)
+            {
+                el->InsertEndChild(el->GetDocument()->NewElement("D:collection"));
+            }});
+            props.push_back(text_prop("D:getcontenttype", "httpd/unix-directory"));
+        }
+        else
+        {
+            props.push_back(ResolvedProp{"D:resourcetype", nullptr});
+
+            uintmax_t size = fs::file_size(local_path, ec);
+            props.push_back(text_prop("D:getcontentlength", std::to_string(!ec ? size : 0)));
+            props.push_back(text_prop("D:getcontenttype", guess_content_type(local_path)));
         }
 
-        xml << "            </D:prop>\n";
-        xml << "            <D:status>HTTP/1.1 200 OK</D:status>\n";
-        xml << "        </D:propstat>\n";
-        xml << "    </D:response>\n";
+        auto write_time = fs::last_write_time(local_path, ec);
+        if (!ec)
+        {
+            props.push_back(text_prop("D:getlastmodified", format_http_date(write_time)));
+            props.push_back(text_prop("D:creationdate", format_iso8601_date(write_time)));
+        }
+
+        props.push_back(text_prop("D:getetag", compute_etag(local_path, is_dir)));
+
+        props.push_back(ResolvedProp{"D:supportedlock", [](tinyxml2::XMLElement* el)
+        {
+            tinyxml2::XMLDocument* doc = el->GetDocument();
+            auto add_entry = [&](const char* scope_tag)
+            {
+                auto* entry = doc->NewElement("D:lockentry");
+                auto* scope = doc->NewElement("D:lockscope");
+                scope->InsertEndChild(doc->NewElement(scope_tag));
+                entry->InsertEndChild(scope);
+                auto* type = doc->NewElement("D:locktype");
+                type->InsertEndChild(doc->NewElement("D:write"));
+                entry->InsertEndChild(type);
+                el->InsertEndChild(entry);
+            };
+            add_entry("D:exclusive");
+            add_entry("D:shared");
+        }});
+
+        std::string fs_path = local_path.string();
+        props.push_back(ResolvedProp{"D:lockdiscovery", [fs_path](tinyxml2::XMLElement* el)
+        {
+            build_lockdiscovery(el, fs_path);
+        }});
+
+        return props;
     }
 
-    void append_recursive_contents(std::ostringstream& xml, const std::string& parent_href, const fs::path& local_path)
+    void fill_prop_element(tinyxml2::XMLElement* prop, const std::vector<ResolvedProp>& props, bool name_only)
+    {
+        tinyxml2::XMLDocument* doc = prop->GetDocument();
+        for (const auto& p : props)
+        {
+            auto* el = doc->NewElement(p.name.c_str());
+            if (!name_only && p.fill)
+            {
+                p.fill(el);
+            }
+            prop->InsertEndChild(el);
+        }
+    }
+
+    void append_resource_xml(tinyxml2::XMLElement* multistatus, const std::string& href_path, const fs::path& local_path, const PropFindRequest& request)
+    {
+        tinyxml2::XMLDocument* doc = multistatus->GetDocument();
+        std::error_code ec;
+        bool is_dir = fs::is_directory(local_path, ec);
+
+        auto* response = doc->NewElement("D:response");
+        multistatus->InsertEndChild(response);
+
+        std::string href = urlEncodePath(href_path);
+        if (is_dir && !href_path.empty() && href_path.back() != '/')
+        {
+            href += "/";
+        }
+        auto* href_el = doc->NewElement("D:href");
+        href_el->SetText(href.c_str());
+        response->InsertEndChild(href_el);
+
+        if (ec)
+        {
+            auto* propstat = doc->NewElement("D:propstat");
+            propstat->InsertEndChild(doc->NewElement("D:prop"));
+            auto* status = doc->NewElement("D:status");
+            status->SetText("HTTP/1.1 404 Not Found");
+            propstat->InsertEndChild(status);
+            response->InsertEndChild(propstat);
+            return;
+        }
+
+        std::vector<ResolvedProp> available = collect_live_properties(href_path, local_path, is_dir);
+
+        if (request.mode == PropFindMode::Prop)
+        {
+            std::vector<ResolvedProp> found;
+            std::vector<std::string> missing;
+
+            for (const auto& want : request.props)
+            {
+                const ResolvedProp* match = nullptr;
+                for (const auto& have : available)
+                {
+                    std::string have_local = have.name;
+                    size_t colon = have_local.find(':');
+                    if (colon != std::string::npos) have_local = have_local.substr(colon + 1);
+
+                    if (have_local == want.name) { match = &have; break; }
+                }
+                if (match) found.push_back(*match);
+                else missing.push_back(want.name);
+            }
+
+            if (!found.empty())
+            {
+                auto* propstat = doc->NewElement("D:propstat");
+                auto* prop = doc->NewElement("D:prop");
+                fill_prop_element(prop, found, false);
+                propstat->InsertEndChild(prop);
+                auto* status = doc->NewElement("D:status");
+                status->SetText("HTTP/1.1 200 OK");
+                propstat->InsertEndChild(status);
+                response->InsertEndChild(propstat);
+            }
+
+            if (!missing.empty())
+            {
+                auto* propstat = doc->NewElement("D:propstat");
+                auto* prop = doc->NewElement("D:prop");
+                for (const auto& name : missing)
+                {
+                    // Preserve the client's requested prefix if any; default to D:.
+                    std::string tag = (name.find(':') != std::string::npos) ? name : ("D:" + name);
+                    prop->InsertEndChild(doc->NewElement(tag.c_str()));
+                }
+                propstat->InsertEndChild(prop);
+                auto* status = doc->NewElement("D:status");
+                status->SetText("HTTP/1.1 404 Not Found");
+                propstat->InsertEndChild(status);
+                response->InsertEndChild(propstat);
+            }
+        }
+        else
+        {
+            bool name_only = (request.mode == PropFindMode::PropName);
+            auto* propstat = doc->NewElement("D:propstat");
+            auto* prop = doc->NewElement("D:prop");
+            fill_prop_element(prop, available, name_only);
+            propstat->InsertEndChild(prop);
+            auto* status = doc->NewElement("D:status");
+            status->SetText("HTTP/1.1 200 OK");
+            propstat->InsertEndChild(status);
+            response->InsertEndChild(propstat);
+        }
+    }
+
+    void append_recursive_contents(tinyxml2::XMLElement* multistatus, const std::string& parent_href, const fs::path& local_path, const PropFindRequest& request)
     {
         std::error_code ec;
         for (const auto& entry : fs::directory_iterator(local_path, fs::directory_options::skip_permission_denied, ec))
@@ -203,17 +507,17 @@ namespace WebDAVServer
                 base_href += "/";
             std::string child_href = base_href + entry.path().filename().string();
 
-            append_resource_xml(xml, child_href, entry.path());
+            append_resource_xml(multistatus, child_href, entry.path(), request);
 
-            // Keep descending if child is a nested subdirectory
             if (entry.is_directory(ec) && !ec)
             {
-                append_recursive_contents(xml, child_href, entry.path());
+                append_recursive_contents(multistatus, child_href, entry.path(), request);
             }
         }
     }
 
-    std::string get_mime_type(const std::string& path) {
+    std::string get_mime_type(const std::string& path)
+    {
         if (path.ends_with(".html") || path.ends_with(".htm")) return "text/html";
         if (path.ends_with(".css")) return "text/css";
         if (path.ends_with(".js")) return "application/javascript";
@@ -345,6 +649,135 @@ namespace WebDAVServer
         return std::nullopt; // Success
     }
 
+    void split_qualified_name(const std::string& full_name, std::string& ns_prefix, std::string& local_name)
+    {
+        size_t colon_pos = full_name.find(':');
+        if (colon_pos != std::string::npos)
+        {
+            ns_prefix = full_name.substr(0, colon_pos);
+            local_name = full_name.substr(colon_pos + 1);
+        }
+        else
+        {
+            ns_prefix = "";
+            local_name = full_name;
+        }
+    }
+
+    PropFindRequest parse_propfind(const std::string& xml_body)
+    {
+        PropFindRequest request;
+        request.mode = PropFindMode::AllProp;
+
+        if (xml_body.empty())
+        {
+            return request;
+        }
+
+        tinyxml2::XMLDocument doc;
+        if (doc.Parse(xml_body.c_str()) != tinyxml2::XML_SUCCESS)
+        {
+            return request; // Fall back to allprop on malformed XML.
+        }
+
+        auto* root = doc.FirstChildElement(); // <D:propfind>
+        if (!root)
+        {
+            return request;
+        }
+
+        for (auto* child = root->FirstChildElement(); child != nullptr; child = child->NextSiblingElement())
+        {
+            std::string ns_prefix, local_name;
+            split_qualified_name(child->Value(), ns_prefix, local_name);
+
+            if (local_name == "propname")
+            {
+                request.mode = PropFindMode::PropName;
+                return request;
+            }
+
+            if (local_name == "allprop")
+            {
+                request.mode = PropFindMode::AllProp;
+                return request;
+            }
+
+            if (local_name == "prop")
+            {
+                request.mode = PropFindMode::Prop;
+                for (auto* p = child->FirstChildElement(); p != nullptr; p = p->NextSiblingElement())
+                {
+                    RequestedProp rp;
+                    split_qualified_name(p->Value(), rp.ns_prefix, rp.name);
+                    request.props.push_back(rp);
+                }
+                return request;
+            }
+        }
+
+        return request;
+    }
+
+    std::string local_name_of(const tinyxml2::XMLElement* el)
+    {
+        std::string ns, local;
+        split_qualified_name(el->Value(), ns, local);
+        return local;
+    }
+
+    struct LockInfo
+    {
+        std::string scope = "exclusive"; // "exclusive" or "shared"
+        std::string owner;               // optional owner text
+    };
+
+    LockInfo parse_lockinfo(const std::string& xml_body)
+    {
+        LockInfo info;
+        if (xml_body.empty()) return info;
+
+        tinyxml2::XMLDocument doc;
+        if (doc.Parse(xml_body.c_str()) != tinyxml2::XML_SUCCESS)
+        {
+            return info;
+        }
+
+        auto* root = doc.FirstChildElement(); // <D:lockinfo>
+        if (!root) return info;
+
+        for (auto* node = root->FirstChildElement(); node != nullptr; node = node->NextSiblingElement())
+        {
+            std::string name = local_name_of(node);
+
+            if (name == "lockscope")
+            {
+                // The scope's single child element names the scope type.
+                if (auto* scope_child = node->FirstChildElement())
+                {
+                    if (local_name_of(scope_child) == "shared") info.scope = "shared";
+                    else info.scope = "exclusive";
+                }
+            }
+            else if (name == "owner")
+            {
+                // Owner may be plain text or contain an <href>; capture whichever
+                // text is available.
+                if (const char* txt = node->GetText())
+                {
+                    info.owner = txt;
+                }
+                else if (auto* href = node->FirstChildElement())
+                {
+                    if (const char* htxt = href->GetText()) info.owner = htxt;
+                }
+            }
+            // <locktype> is always write for this server; nothing to extract.
+        }
+
+        return info;
+    }
+
     std::vector<PropAction> parse_proppatch(const std::string& xml_body)
     {
         std::vector<PropAction> actions;
@@ -408,68 +841,101 @@ namespace WebDAVServer
         return actions;
     }
 
+    std::string print_xml(const tinyxml2::XMLDocument& doc)
+    {
+        tinyxml2::XMLPrinter printer;
+        doc.Print(&printer);
+        return std::string(printer.CStr());
+    }
+
     std::string build_proppatch_success_response(const std::string& href, const std::vector<PropAction>& actions)
     {
-        std::ostringstream xml;
+        tinyxml2::XMLDocument doc;
+        doc.InsertFirstChild(doc.NewDeclaration());
 
-        xml << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
-        xml << "<D:multistatus xmlns:D=\"DAV:\">\n";
-        xml << "  <D:response>\n";
-        xml << "    <D:href>" << urlEncodePath(href) << "</D:href>\n";
-        xml << "    <D:propstat>\n";
-        xml << "      <D:prop>\n";
+        auto* multistatus = doc.NewElement("D:multistatus");
+        multistatus->SetAttribute("xmlns:D", "DAV:");
+        doc.InsertEndChild(multistatus);
+
+        auto* response = doc.NewElement("D:response");
+        multistatus->InsertEndChild(response);
+
+        auto* href_el = doc.NewElement("D:href");
+        href_el->SetText(urlEncodePath(href).c_str());
+        response->InsertEndChild(href_el);
+
+        auto* propstat = doc.NewElement("D:propstat");
+        response->InsertEndChild(propstat);
+
+        auto* prop = doc.NewElement("D:prop");
+        propstat->InsertEndChild(prop);
 
         for (const auto& action : actions)
         {
             std::string tag_name = action.ns_prefix.empty() ? action.name : (action.ns_prefix + ":" + action.name);
-            std::string safe_tag = escapeXmlText(tag_name);
-            xml << "        <" << safe_tag << "/>\n";
+            prop->InsertEndChild(doc.NewElement(tag_name.c_str()));
         }
 
-        xml << "      </D:prop>\n";
-        xml << "      <D:status>HTTP/1.1 200 OK</D:status>\n";
-        xml << "    </D:propstat>\n";
-        xml << "  </D:response>\n";
-        xml << "</D:multistatus>";
+        auto* status = doc.NewElement("D:status");
+        status->SetText("HTTP/1.1 200 OK");
+        propstat->InsertEndChild(status);
 
-        return xml.str();
+        return print_xml(doc);
     }
 
-    std::string build_lock_success_response(const std::string& href, const std::string& token)
+    std::string build_lock_success_response(const std::string& href, const std::string& token,
+                                            const std::string& scope, long timeout_seconds)
     {
-        std::ostringstream xml;
+        tinyxml2::XMLDocument doc;
+        doc.InsertFirstChild(doc.NewDeclaration());
 
-        xml << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
-        xml << "<D:prop xmlns:D=\"DAV:\">\n";
-        xml << "  <D:lockdiscovery>\n";
-        xml << "    <D:activelock>\n";
-        xml << "      <D:locktype>\n";
-        xml << "        <D:write/>\n";
-        xml << "      </D:locktype>\n";
-        xml << "      <D:lockscope>\n";
-        xml << "        <D:exclusive/>\n";
-        xml << "      </D:lockscope>\n";
-        xml << "      <D:depth>0</D:depth>\n";
-        xml << "      <D:timeout>Second-3600</D:timeout>\n";
+        auto* prop = doc.NewElement("D:prop");
+        prop->SetAttribute("xmlns:D", "DAV:");
+        doc.InsertEndChild(prop);
+
+        auto* lockdiscovery = doc.NewElement("D:lockdiscovery");
+        prop->InsertEndChild(lockdiscovery);
+
+        auto* activelock = doc.NewElement("D:activelock");
+        lockdiscovery->InsertEndChild(activelock);
+
+        auto* locktype = doc.NewElement("D:locktype");
+        locktype->InsertEndChild(doc.NewElement("D:write"));
+        activelock->InsertEndChild(locktype);
+
+        auto* lockscope = doc.NewElement("D:lockscope");
+        lockscope->InsertEndChild(doc.NewElement(scope == "shared" ? "D:shared" : "D:exclusive"));
+        activelock->InsertEndChild(lockscope);
+
+        auto* depth = doc.NewElement("D:depth");
+        depth->SetText("0");
+        activelock->InsertEndChild(depth);
+
+        auto* timeout = doc.NewElement("D:timeout");
+        timeout->SetText(("Second-" + std::to_string(timeout_seconds)).c_str());
+        activelock->InsertEndChild(timeout);
+
         std::string full_token_uri = "opaquelocktoken:" + token;
-        xml << "      <D:locktoken>\n";
-        xml << "        <D:href>" << escapeXmlText(urlEncodePath(full_token_uri)) << "</D:href>\n";
-        xml << "      </D:locktoken>\n";
-        xml << "      <D:lockroot>\n";
-        xml << "        <D:href>" << escapeXmlText(urlEncodePath(href)) << "</D:href>\n";
-        xml << "      </D:lockroot>\n";
-        xml << "    </D:activelock>\n";
-        xml << "  </D:lockdiscovery>\n";
-        xml << "</D:prop>";
+        auto* locktoken = doc.NewElement("D:locktoken");
+        auto* token_href = doc.NewElement("D:href");
+        token_href->SetText(urlEncodePath(full_token_uri).c_str());
+        locktoken->InsertEndChild(token_href);
+        activelock->InsertEndChild(locktoken);
 
-        return xml.str();
+        auto* lockroot = doc.NewElement("D:lockroot");
+        auto* root_href = doc.NewElement("D:href");
+        root_href->SetText(urlEncodePath(href).c_str());
+        lockroot->InsertEndChild(root_href);
+        activelock->InsertEndChild(lockroot);
+
+        return print_xml(doc);
     }
 
     bool is_resource_locked(const std::string& path, const Request& req)
     {
         std::lock_guard<std::mutex> guard(g_lock_mutex);
-        
-        // Look up if the exact path is locked
+        purge_expired_locks();
+
         auto it = g_path_to_lock.find(path);
         if (it == g_path_to_lock.end())
         {
@@ -520,7 +986,6 @@ namespace WebDAVServer
             }
         }
         
-        // 2. Percent-decode the URI (e.g., convert "%20" back to spaces)
         std::string decoded;
         decoded.reserve(dest_header.length());
         for (size_t i = 0; i < dest_header.length(); ++i)
@@ -567,7 +1032,8 @@ namespace WebDAVServer
             }
 
             std::sort(directories_to_delete.begin(), directories_to_delete.end(),
-                    [](const fs::path& a, const fs::path& b) {
+                    [](const fs::path& a, const fs::path& b)
+                    {
                         return a.string().length() > b.string().length();
                     });
 
@@ -585,17 +1051,39 @@ namespace WebDAVServer
     {
         std::regex regex(R"(bytes\s+(\d+)-(\d+)/(\d+|\*))");
         std::smatch match;
-        if (std::regex_match(header, match, regex)) {
+        if (std::regex_match(header, match, regex))
+        {
             start = std::stoull(match[1].str());
             end = std::stoull(match[2].str());
-            if (match[3].str() != "*") {
+            if (match[3].str() != "*")
+            {
                 total = std::stoull(match[3].str());
-            } else {
+            }
+            else
+            {
                 total = 0;
             }
             return true;
         }
         return false;
+    }
+
+    // Write the whole buffer, looping over short writes. Returns false on any
+    // write() error (and leaves errno set by the failing call).
+    bool write_all(int fd, const char* data, size_t length)
+    {
+        size_t written = 0;
+        while (written < length)
+        {
+            ssize_t n = write(fd, data + written, length - written);
+            if (n < 0)
+            {
+                if (errno == EINTR) continue; // retry interrupted syscall
+                return false;
+            }
+            written += static_cast<size_t>(n);
+        }
+        return true;
     }
 
     void ServerThread()
@@ -606,12 +1094,14 @@ namespace WebDAVServer
             
             if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, 
                         reinterpret_cast<const char*>(&send_buf_size), 
-                        sizeof(send_buf_size)) < 0) {
+                        sizeof(send_buf_size)) < 0)
+            {
             }
 
             if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, 
                         reinterpret_cast<const char*>(&send_buf_size), 
-                        sizeof(send_buf_size)) < 0) {
+                        sizeof(send_buf_size)) < 0)
+            {
             }
 
             int nodelay = 1;
@@ -630,7 +1120,7 @@ namespace WebDAVServer
         {
             res.status = 200;
             char version[20];
-            sprintf(version, "%.2f", 1.0f);
+            snprintf(version, sizeof(version), "%.2f", static_cast<double>(APP_VERSION));
             res.set_content(version, "text/html");
         });
 
@@ -684,17 +1174,50 @@ namespace WebDAVServer
                         << "\">.. (Parent Directory)</a></div></li>";
                 }
 
-                size_t id_counter = 0;
-                for (const auto& entry : fs::directory_iterator(canonical_path))
+                // Collect entries error-safely (a permission error on one
+                // child shouldn't throw and abort the whole listing), then
+                // sort: directories first, then case-insensitive by name.
+                struct DirItem { fs::path path; std::string name; bool is_dir; };
+                std::vector<DirItem> items;
+
+                std::error_code dir_ec;
+                for (fs::directory_iterator it(canonical_path, fs::directory_options::skip_permission_denied, dir_ec), end;
+                     !dir_ec && it != end;
+                     it.increment(dir_ec))
                 {
-                    auto filename = entry.path().filename().string();
+                    std::error_code item_ec;
+                    bool is_dir = it->is_directory(item_ec);
+                    items.push_back({it->path(), it->path().filename().string(), !item_ec && is_dir});
+                }
+
+                std::sort(items.begin(), items.end(),
+                    [](const DirItem& a, const DirItem& b)
+                    {
+                        if (a.is_dir != b.is_dir) return a.is_dir; // directories first
+                        // case-insensitive name comparison
+                        const std::string& x = a.name;
+                        const std::string& y = b.name;
+                        size_t n = std::min(x.size(), y.size());
+                        for (size_t i = 0; i < n; ++i)
+                        {
+                            char cx = static_cast<char>(std::tolower(static_cast<unsigned char>(x[i])));
+                            char cy = static_cast<char>(std::tolower(static_cast<unsigned char>(y[i])));
+                            if (cx != cy) return cx < cy;
+                        }
+                        return x.size() < y.size();
+                    });
+
+                size_t id_counter = 0;
+                for (const auto& entry : items)
+                {
+                    auto filename = entry.name;
                     std::string href = req.path;
                     if (!href.ends_with("/")) href += "/";
                     href += filename;
                     id_counter++;
                     std::string el_id = "file_" + std::to_string(id_counter);
 
-                    if (fs::is_directory(entry.path()))
+                    if (entry.is_dir)
                     {
                         filename += "/"; href += "/";
                         html << "<li><div class='row'><a href=\"" << href 
@@ -728,17 +1251,33 @@ namespace WebDAVServer
             else
             {
                 std::string path_str = canonical_path.string();
-                std::ifstream file(path_str, std::ios::binary | std::ios::ate);
-                if (!file) { res.status = 500; return; }
-                size_t file_size = file.tellg();
-                file.close();
+
+                // Determine the size with stat() rather than ifstream::tellg().
+                // On PS5 the libc/filesystem reports an incorrect position for
+                // an ate-opened stream, so tellg() yields a wrong size there;
+                // st_size is accurate on both PS5 and Linux/WSL.
+                struct stat file_stat;
+                if (::stat(path_str.c_str(), &file_stat) != 0)
+                {
+                    res.status = 500;
+                    return;
+                }
+                size_t file_size = static_cast<size_t>(file_stat.st_size);
 
                 res.set_header("Accept-Ranges", "bytes");
+
+                // Validators so clients can cache and issue conditional GETs.
+                // Mirrors the ETag reported for this resource via PROPFIND.
+                res.set_header("ETag", compute_etag(canonical_path, false));
+                res.set_header("Last-Modified", format_http_date(static_cast<std::time_t>(file_stat.st_mtim.tv_sec)));
+
+                std::string mime = get_mime_type(path_str);
 
                 if (req.method == "HEAD")
                 {
                     res.status = 200;
-                    res.set_header("Content-Length", std::to_string(file_size)); 
+                    res.set_header("Content-Length", std::to_string(file_size));
+                    res.set_header("Content-Type", mime);
                     return;
                 }
 
@@ -748,7 +1287,7 @@ namespace WebDAVServer
                 }
 
                 res.set_content_provider(
-                    file_size, get_mime_type(path_str),
+                    file_size, mime,
                     [path_str](size_t offset, size_t length, DataSink &sink)
                 {
                     std::ifstream stream(path_str, std::ios::binary);
@@ -794,9 +1333,17 @@ namespace WebDAVServer
 
         svr->CustomRoute("PROPFIND", R"((.*))", [&](const Request &req, Response &res)
         {
-            fs::path local_path(req.path);
-
+            // Canonicalize the path the same way the GET handler does, so that
+            // traversal/symlink handling is consistent across methods.
             std::error_code ec;
+            fs::path local_path = fs::weakly_canonical(fs::path(req.path), ec);
+            if (ec)
+            {
+                res.status = 403;
+                res.set_content("Forbidden", "text/plain");
+                return;
+            }
+
             if (!fs::exists(local_path, ec))
             {
                 res.status = 404;
@@ -804,16 +1351,30 @@ namespace WebDAVServer
                 return;
             }
 
+            // Validate Depth. RFC 4918 defaults a missing Depth to "infinity".
             std::string depth = "infinity";
-            if (req.has_header("Depth")) {
+            if (req.has_header("Depth"))
+            {
                 depth = req.get_header_value("Depth");
             }
+            if (depth != "0" && depth != "1" && depth != "infinity")
+            {
+                res.status = 400;
+                res.set_content("Invalid Depth header.", "text/plain");
+                return;
+            }
 
-            std::ostringstream xml;
-            xml << "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n";
-            xml << "<D:multistatus xmlns:D=\"DAV:\">\n";
+            // Parse the request body to learn which properties the client wants.
+            PropFindRequest request = parse_propfind(req.body);
 
-            append_resource_xml(xml, req.path, local_path);
+            tinyxml2::XMLDocument doc;
+            doc.InsertFirstChild(doc.NewDeclaration()); // <?xml version="1.0" encoding="UTF-8"?>
+
+            auto* multistatus = doc.NewElement("D:multistatus");
+            multistatus->SetAttribute("xmlns:D", "DAV:");
+            doc.InsertEndChild(multistatus);
+
+            append_resource_xml(multistatus, req.path, local_path, request);
 
             if (fs::is_directory(local_path, ec) && !ec)
             {
@@ -825,19 +1386,17 @@ namespace WebDAVServer
                         if (parent_href.back() != '/') parent_href += "/";
                         std::string child_href = parent_href + entry.path().filename().string();
 
-                        append_resource_xml(xml, child_href, entry.path());
+                        append_resource_xml(multistatus, child_href, entry.path(), request);
                     }
                 } 
                 else if (depth == "infinity")
                 {
-                    append_recursive_contents(xml, req.path, local_path);
+                    append_recursive_contents(multistatus, req.path, local_path, request);
                 }
             }
 
-            xml << "</D:multistatus>";
-
             res.status = 207; // Multi-Status
-            res.set_content(xml.str(), "application/xml; charset=utf-8");
+            res.set_content(print_xml(doc), "application/xml; charset=utf-8");
             res.set_header("DAV", "1, 2");
             res.set_header("Accept-Ranges", "bytes");
 
@@ -848,98 +1407,146 @@ namespace WebDAVServer
 
         svr->Put(R"((.*))", [&](const Request &req, Response &res, const ContentReader &content_reader)
         {
-            std::string target_path = req.path;
+            fs::path target_path(req.path);
+
+            // RFC 4918 9.7.1: PUT to a path whose parent collection does not
+            // exist must fail with 409 Conflict (the client should MKCOL first).
+            std::error_code pec;
+            fs::path parent = target_path.parent_path();
+            if (!parent.empty() && !fs::is_directory(parent, pec))
+            {
+                res.status = 409; // Conflict
+                res.set_content("Parent collection does not exist.", "text/plain");
+                return;
+            }
+
+            bool target_existed = fs::exists(target_path, pec);
+
             size_t range_start = 0, range_end = 0, total_file_size = 0;
             bool has_range = req.has_header("Content-Range");
+            if (has_range)
+            {
+                parse_content_range(req.get_header_value("Content-Range"),
+                                    range_start, range_end, total_file_size);
+            }
+
+            const size_t FLUSH_THRESHOLD = 1024 * 1024; // flush accumulator at 1 MB
 
             if (has_range)
             {
-                std::string content_range = req.get_header_value("Content-Range");
-                parse_content_range(content_range, range_start, range_end, total_file_size);
+                // Partial/ranged PUT: write in place at the given offset. A
+                // temp-file swap can't be used here because we're patching an
+                // existing file rather than replacing it wholesale.
+                int fd = open(req.path.c_str(), O_WRONLY | O_CREAT, 0666);
+                if (fd < 0)
+                {
+                    res.status = (errno == ENOENT || errno == ENOTDIR) ? 409 : 500;
+                    return;
+                }
+                // Enforce the extension-based mode on every PUT (create or
+                // patch), so executable payloads (.elf/.self/.bin/.prx/.sprx)
+                // always end up 0777 even when the file already existed.
+                fchmod(fd, put_create_mode(target_path));
+                if (range_start > 0 && lseek(fd, static_cast<off_t>(range_start), SEEK_SET) < 0)
+                {
+                    close(fd);
+                    res.status = 500;
+                    return;
+                }
+
+                std::vector<char> acc;
+                acc.reserve(FLUSH_THRESHOLD);
+                bool ok = content_reader([&](const char* data, size_t len)
+                {
+                    acc.insert(acc.end(), data, data + len);
+                    if (acc.size() >= FLUSH_THRESHOLD)
+                    {
+                        if (!write_all(fd, acc.data(), acc.size())) return false;
+                        acc.clear();
+                    }
+                    return true;
+                });
+                if (ok && !acc.empty()) ok = write_all(fd, acc.data(), acc.size());
+
+                // Surface flush/close errors (e.g. ENOSPC) that write() may not report.
+                if (ok && fsync(fd) != 0) ok = false;
+                if (close(fd) != 0) ok = false;
+
+                if (!ok)
+                {
+                    res.status = 500;
+                    res.set_content("Write failed.", "text/plain");
+                    return;
+                }
+
+                res.status = 206;
+                res.set_content("Partial content written.", "text/plain");
+                return;
             }
 
-            int flags = O_WRONLY;
-            if (req.body.empty() || req.get_header_value("Content-Length") == "0")
-            {
-                flags |= O_CREAT | O_TRUNC;
-            }
-            else
-            {
-                flags |= (access(target_path.c_str(), F_OK) == 0) ? O_RDWR : O_CREAT;
-            }
+            // Full-body PUT: stream into a temp file in the same directory, then
+            // atomically rename over the target. This truncates correctly on
+            // overwrite, never corrupts an existing file on a failed upload, and
+            // avoids leaving partial files behind.
+            fs::path tmp_path = target_path;
+            tmp_path += ".tmp-" + generate_uuid();
 
-            int fd = open(target_path.c_str(), flags, 0666);
+            int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (fd < 0)
             {
-                res.status = 500;
+                res.status = (errno == ENOENT || errno == ENOTDIR) ? 409 : 500;
                 return;
             }
+            // Set the final permission from the *target* extension (not the
+            // temp name) with fchmod, so the mode is exact regardless of umask
+            // and survives the rename below.
+            fchmod(fd, put_create_mode(target_path));
 
-            if (range_start > 0 && lseek(fd, range_start, SEEK_SET) < 0)
+            std::vector<char> acc;
+            acc.reserve(FLUSH_THRESHOLD);
+            bool ok = content_reader([&](const char* data, size_t len)
             {
-                close(fd);
-                res.status = 500;
-                return;
-            }
-
-            const size_t TARGET_CHUNK_SIZE = 1024 * 1024; // 1 Megabyte
-            std::vector<char> upload_accumulator;
-            upload_accumulator.reserve(TARGET_CHUNK_SIZE);
-
-            bool write_success = content_reader([&](const char* data, size_t data_length)
-            {
-                upload_accumulator.insert(upload_accumulator.end(), data, data + data_length);
-
-                if (upload_accumulator.size() >= TARGET_CHUNK_SIZE)
+                acc.insert(acc.end(), data, data + len);
+                if (acc.size() >= FLUSH_THRESHOLD)
                 {
-                    size_t total_written = 0;
-                    size_t to_write = upload_accumulator.size();
-                    const char* ptr = upload_accumulator.data();
-
-                    while (total_written < to_write)
-                    {
-                        ssize_t bytes_written = write(fd, ptr + total_written, to_write - total_written);
-                        if (bytes_written < 0)
-                        {
-                            return false; // Physical write error encounter
-                        }
-                        total_written += bytes_written;
-                    }
-                    
-                    upload_accumulator.clear();
+                    if (!write_all(fd, acc.data(), acc.size())) return false;
+                    acc.clear();
                 }
                 return true;
             });
+            if (ok && !acc.empty()) ok = write_all(fd, acc.data(), acc.size());
 
-            if (write_success && !upload_accumulator.empty())
+            // fsync BEFORE rename so the data is durable; check both it and close
+            // because disk-full/IO errors frequently surface only at flush time.
+            if (ok && fsync(fd) != 0) ok = false;
+            if (close(fd) != 0) ok = false;
+
+            if (!ok)
             {
-                size_t total_written = 0;
-                size_t to_write = upload_accumulator.size();
-                const char* ptr = upload_accumulator.data();
-
-                while (total_written < to_write)
-                {
-                    ssize_t bytes_written = write(fd, ptr + total_written, to_write - total_written);
-                    if (bytes_written < 0)
-                    {
-                        write_success = false;
-                        break;
-                    }
-                    total_written += bytes_written;
-                }
+                std::error_code rm_ec;
+                fs::remove(tmp_path, rm_ec); // don't leave a partial temp file
+                res.status = 500;
+                res.set_content("Write failed.", "text/plain");
+                return;
             }
 
-            fsync(fd); 
-            close(fd);
-
-            if (write_success)
+            std::error_code mv_ec;
+            fs::rename(tmp_path, target_path, mv_ec);
+            if (mv_ec)
             {
-                res.status = has_range ? 206 : 201;
-                res.set_content("Success", "text/plain");
+                std::error_code rm_ec;
+                fs::remove(tmp_path, rm_ec);
+                res.status = 500;
+                res.set_content("Could not finalize upload.", "text/plain");
+                return;
             }
-            else
+
+            // 201 when a new resource was created, 204 when an existing one was
+            // overwritten (RFC 4918 9.7.1).
+            res.status = target_existed ? 204 : 201;
+            if (!target_existed)
             {
-                res.status = 400;
+                res.set_content("Created", "text/plain");
             }
         });
 
@@ -1055,7 +1662,8 @@ namespace WebDAVServer
 
             std::string depth = req.has_header("Depth") ? req.get_header_value("Depth") : "infinity";
 
-            try {
+            try
+            {
                 if (dest_exists)
                 {
                     safe_remove_all(dest_path);
@@ -1076,7 +1684,6 @@ namespace WebDAVServer
                         res.set_header("Content-Length", "0");
                         return;
                     }
-                    // For regular files, Depth 0 acts as a standard single file copy
                 }
 
                 fs::copy(src_path, dest_path, options);
@@ -1092,7 +1699,8 @@ namespace WebDAVServer
             }
         });
 
-        svr->CustomRoute("MOVE", R"((.*))", [&](const Request& req, Response& res) {
+        svr->CustomRoute("MOVE", R"((.*))", [&](const Request& req, Response& res)
+        {
             if (!req.has_header("Destination"))
             {
                 res.status = 400;
@@ -1109,7 +1717,6 @@ namespace WebDAVServer
             }
             */
 
-            // Use the request path and destination header directly as system paths
             fs::path src_path(req.path);
             fs::path dest_path(parse_destination_path(req.get_header_value("Destination")));
 
@@ -1180,61 +1787,56 @@ namespace WebDAVServer
             }
         });
 
-        svr->CustomRoute("LOCK", R"((.*))", [](const Request& req, Response& res) {
+        svr->CustomRoute("LOCK", R"((.*))", [](const Request& req, Response& res)
+        {
             std::string target_path = req.path;
 
-            std::string owner_info = "";
-            std::string lock_scope = "exclusive"; // Default standard fallback
+            LockInfo lock_info = parse_lockinfo(req.body);
+            std::string lock_scope = lock_info.scope;
+            std::string owner_info = lock_info.owner;
 
-            // Parse incoming XML payload if present (Initial Lock Request)
-            if (!req.body.empty())
+            std::lock_guard<std::mutex> guard(g_lock_mutex);
+            purge_expired_locks(); // drop any lapsed locks before deciding
+
+            auto now = std::chrono::steady_clock::now();
+            auto new_expiry = now + std::chrono::seconds(LOCK_TIMEOUT_SECONDS);
+
+            auto it = g_path_to_lock.find(target_path);
+            if (it != g_path_to_lock.end())
             {
-                tinyxml2::XMLDocument doc;
-                if (doc.Parse(req.body.c_str()) == tinyxml2::XML_SUCCESS)
+                bool token_matches = false;
+                if (req.has_header("If"))
                 {
-                    auto* root = doc.FirstChildElement();
-                    if (root)
-                    {
-                        // Extract scope: exclusive or shared
-                        auto* lockscope_node = root->FirstChildElement();
-                        if (lockscope_node && std::string(lockscope_node->Value()).find("lockscope") != std::string::npos)
-                        {
-                            auto* scope_child = lockscope_node->FirstChildElement();
-                            if (scope_child)
-                            {
-                                std::string scope_val = scope_child->Value();
-                                if (scope_val.find("shared") != std::string::npos) lock_scope = "shared";
-                            }
-                        }
+                    token_matches = req.get_header_value("If").find(it->second.token) != std::string::npos;
+                }
 
-                        // Extract owner text info if submitted by client
-                        auto* owner_node = root->FirstChildElement("D:owner");
-                        if (!owner_node)
-                            owner_node = root->FirstChildElement("owner");
-                        if (owner_node && owner_node->GetText())
-                        {
-                            owner_info = owner_node->GetText();
-                        }
-                    }
+                if (token_matches)
+                {
+                    it->second.expiry = new_expiry;
+
+                    std::string raw = it->second.token;
+                    const std::string prefix = "opaquelocktoken:";
+                    if (raw.rfind(prefix, 0) == 0) raw = raw.substr(prefix.size());
+
+                    std::string xml_res = build_lock_success_response(
+                        target_path, raw, it->second.scope, lock_seconds_remaining(it->second));
+                    res.set_header("Lock-Token", "<" + it->second.token + ">");
+                    res.status = 200;
+                    res.set_content(xml_res, "text/xml; charset=utf-8");
+                    return;
+                }
+
+                if (it->second.scope == "exclusive" || lock_scope == "exclusive")
+                {
+                    res.status = 423; // Locked
+                    res.set_content("Resource already locked.", "text/plain");
+                    return;
                 }
             }
 
-            std::lock_guard<std::mutex> guard(g_lock_mutex);
-
-            // Check if the resource is already exclusively locked
-            auto it = g_path_to_lock.find(target_path);
-            if (it != g_path_to_lock.end() && it->second.scope == "exclusive")
-            {
-                res.status = 423; // Locked
-                res.set_content("Resource already exclusively locked.", "text/plain");
-                return;
-            }
-
-            // Generate tracking tokens
             std::string raw_token = generate_uuid();
             std::string full_lock_token = "opaquelocktoken:" + raw_token;
 
-            // Register the active lock state
             WebDavLock new_lock;
             new_lock.path = target_path;
             new_lock.token = full_lock_token;
@@ -1242,19 +1844,21 @@ namespace WebDAVServer
             new_lock.scope = lock_scope;
             new_lock.owner = owner_info;
             new_lock.depth = 0; // Default
+            new_lock.expiry = new_expiry;
 
             g_path_to_lock[target_path] = new_lock;
             g_token_to_path[full_lock_token] = target_path;
 
-            // Construct compliant WebDAV response XML payload
-            std::string xml_res = build_lock_success_response(target_path, raw_token);
+            std::string xml_res = build_lock_success_response(
+                target_path, raw_token, lock_scope, LOCK_TIMEOUT_SECONDS);
 
             res.set_header("Lock-Token", "<" + full_lock_token + ">");
             res.status = 200;
             res.set_content(xml_res, "text/xml; charset=utf-8");
         });
 
-        svr->CustomRoute("UNLOCK", R"((.*))", [](const Request& req, Response& res) {
+        svr->CustomRoute("UNLOCK", R"((.*))", [](const Request& req, Response& res)
+        {
             if (!req.has_header("Lock-Token"))
             {
                 res.status = 400;
@@ -1262,16 +1866,15 @@ namespace WebDAVServer
                 return;
             }
 
-            // Standard WebDAV headers wrap tokens in angle brackets, e.g., <opaquelocktoken:UUID>
-            std::string raw_header_token = req.get_header_value("Lock-Token");
-            std::string clean_token = raw_header_token;
-            
-            if (clean_token.front() == '<' && clean_token.back() == '>')
+            std::string clean_token = req.get_header_value("Lock-Token");
+
+            if (clean_token.size() >= 2 && clean_token.front() == '<' && clean_token.back() == '>')
             {
                 clean_token = clean_token.substr(1, clean_token.length() - 2);
             }
 
             std::lock_guard<std::mutex> guard(g_lock_mutex);
+            purge_expired_locks();
 
             // Validate if token exists and corresponds to this actual execution path
             auto token_it = g_token_to_path.find(clean_token);
@@ -1371,7 +1974,8 @@ namespace WebDAVServer
 
     bool IsStarted()
     {
-        Client client = Client("http://127.0.0.1:6702");
+        std::string base_url = "http://127.0.0.1:" + std::to_string(http_server_port);
+        Client client = Client(base_url);
         if (auto res = client.Get("/version"))
         {
             return true;
