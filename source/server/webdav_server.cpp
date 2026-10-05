@@ -15,7 +15,7 @@
 #include "http/httplib.h"
 #include "server/webdav_server.h"
 #include "util.h"
-// #include "dbglogger.h"
+#include "dbglogger.h"
 
 using namespace httplib;
 namespace fs = std::filesystem;
@@ -1434,6 +1434,13 @@ namespace WebDAVServer
         {
             fs::path target_path(req.path);
 
+            // --- PUT diagnostics (temporary) ---
+            dbglogger_log("PUT begin path=%s CL=%s TE=%s CR=%s",
+                req.path.c_str(),
+                req.has_header("Content-Length") ? req.get_header_value("Content-Length").c_str() : "(none)",
+                req.has_header("Transfer-Encoding") ? req.get_header_value("Transfer-Encoding").c_str() : "(none)",
+                req.has_header("Content-Range") ? req.get_header_value("Content-Range").c_str() : "(none)");
+
             // RFC 4918 9.7.1: PUT to a path whose parent collection does not
             // exist must fail with 409 Conflict (the client should MKCOL first).
             std::error_code pec;
@@ -1447,6 +1454,20 @@ namespace WebDAVServer
 
             bool target_existed = fs::exists(target_path, pec);
 
+            // If the client declared a body length, remember it so we can refuse
+            // to report success on a short/truncated upload. Chunked uploads
+            // (Transfer-Encoding: chunked) carry no Content-Length, so this is
+            // only enforced when the length is actually known.
+            bool have_expected_len = req.has_header("Content-Length");
+            unsigned long long expected_len = 0;
+            if (have_expected_len)
+            {
+                const std::string& cl = req.get_header_value("Content-Length");
+                char* e = nullptr;
+                expected_len = std::strtoull(cl.c_str(), &e, 10);
+                if (e == cl.c_str()) have_expected_len = false; // unparseable
+            }
+
             size_t range_start = 0, range_end = 0, total_file_size = 0;
             bool has_range = req.has_header("Content-Range");
             if (has_range)
@@ -1459,6 +1480,8 @@ namespace WebDAVServer
 
             if (has_range)
             {
+                dbglogger_log("PUT ranged branch path=%s start=%zu end=%zu total=%zu",
+                    req.path.c_str(), range_start, range_end, total_file_size);
                 // Partial/ranged PUT: write in place at the given offset. A
                 // temp-file swap can't be used here because we're patching an
                 // existing file rather than replacing it wholesale.
@@ -1531,8 +1554,10 @@ namespace WebDAVServer
 
             std::vector<char> acc;
             acc.reserve(FLUSH_THRESHOLD);
+            unsigned long long received = 0;
             bool ok = content_reader([&](const char* data, size_t len)
             {
+                received += len;
                 acc.insert(acc.end(), data, data + len);
                 if (acc.size() >= FLUSH_THRESHOLD)
                 {
@@ -1543,22 +1568,39 @@ namespace WebDAVServer
             });
             if (ok && !acc.empty()) ok = write_all(fd, acc.data(), acc.size());
 
+            dbglogger_log("PUT fullbody read done path=%s received=%llu reader_ok=%d",
+                req.path.c_str(), received, ok ? 1 : 0);
+
             // fsync BEFORE rename so the data is durable; check both it and close
             // because disk-full/IO errors frequently surface only at flush time.
             if (ok && fsync(fd) != 0) ok = false;
             if (close(fd) != 0) ok = false;
+
+            // Truncation guard: if the client declared a Content-Length, the body
+            // we actually read must match it. A short read (e.g. a dropped or
+            // mis-decoded stream) must NOT be reported as a successful upload,
+            // or the client will delete its only copy of a now-corrupt file.
+            if (ok && have_expected_len && received != expected_len)
+            {
+                dbglogger_log("PUT length mismatch path=%s received=%llu expected=%llu",
+                    req.path.c_str(), received, expected_len);
+                ok = false;
+            }
 
             if (!ok)
             {
                 std::error_code rm_ec;
                 fs::remove(tmp_path, rm_ec); // don't leave a partial temp file
                 res.status = 500;
-                res.set_content("Write failed.", "text/plain");
+                res.set_content("Incomplete upload (body shorter than declared).", "text/plain");
                 return;
             }
 
             std::error_code mv_ec;
             fs::rename(tmp_path, target_path, mv_ec);
+            dbglogger_log("PUT rename path=%s tmp=%s err=%s",
+                target_path.string().c_str(), tmp_path.string().c_str(),
+                mv_ec ? mv_ec.message().c_str() : "ok");
             if (mv_ec)
             {
                 std::error_code rm_ec;

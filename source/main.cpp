@@ -14,7 +14,7 @@
 #include "sceSystemService.h"
 #endif
 #include "util.h"
-// #include "dbglogger.h"
+#include "dbglogger.h"
 
 #ifndef PLATFORM_WSL
 static bool in_rest_mode = false;
@@ -62,8 +62,8 @@ static void *SystemEventThread(void *argp)
 
 int main(int argc, char *argv[])
 {
-    // dbglogger_init();
-    // dbglogger_log("If you see this you've set up dbglogger correctly.");
+    dbglogger_init();
+    dbglogger_log("If you see this you've set up dbglogger correctly.");
 
     if (WebDAVServer::IsStarted())
     {
