@@ -118,11 +118,31 @@ namespace WebDAVServer
         snprintf(buf, sizeof(buf), "%s\n", query.c_str());
         s += buf;
 
+        // Connection / routing context — helps distinguish overlapping uploads
+        // (different remote ports) and confirm which route handled the request.
+        snprintf(buf, sizeof(buf), "remote: %s:%d  local: %s:%d\n",
+                 req.remote_addr.c_str(), req.remote_port,
+                 req.local_addr.c_str(), req.local_port);
+        s += buf;
+        snprintf(buf, sizeof(buf), "matched_route: %s\n", req.matched_route.c_str());
+        s += buf;
+
+        // Body framing: buffered body size and the number of Range specs parsed.
+        // (For streamed PUTs the body is read via ContentReader, so req.body may
+        // be empty here even for a large upload.)
+        snprintf(buf, sizeof(buf), "req.body.size: %zu  ranges: %zu  conn_closed: %d\n",
+                 req.body.size(), req.ranges.size(),
+                 req.is_connection_closed ? (req.is_connection_closed() ? 1 : 0) : -1);
+        s += buf;
+
         s += dump_headers(req.headers);
 
         s += "--------------------------------\n";
 
-        snprintf(buf, sizeof(buf), "%d %s\n", res.status, res.version.c_str());
+        snprintf(buf, sizeof(buf), "%d %s %s\n", res.status, res.version.c_str(),
+                 res.reason.c_str());
+        s += buf;
+        snprintf(buf, sizeof(buf), "res.body.size: %zu\n", res.body.size());
         s += buf;
         s += dump_headers(res.headers);
         s += "\n";
@@ -1992,12 +2012,10 @@ namespace WebDAVServer
             res.set_content(xml_res, "text/xml; charset=utf-8");
         });
 
-        /*
         svr->set_logger([](const Request &req, const Response &res)
         {
             dbglogger_log("%s", log(req, res).c_str());
         });
-        */
 
         // Support upto 500GB of file upload
         svr->set_payload_max_length(500ULL * 1024 * 1024 * 1024);
