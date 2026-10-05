@@ -6,6 +6,7 @@
 #include <optional>
 #include <functional>
 #include <vector>
+#include <cstdlib>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -221,6 +222,30 @@ namespace WebDAVServer
             return 0777;
         }
         return 0666;
+    }
+
+    // ownCloud/Nextcloud modtime preservation: if the client sent X-OC-Mtime
+    // (unix seconds), set the file's modification time to it and echo
+    // "X-OC-Mtime: accepted" so rclone (vendor=owncloud) knows it was applied
+    // and skips a follow-up request to set the time. No-op if the header is
+    // absent or unparseable.
+    void apply_oc_mtime(const Request& req, Response& res, const std::string& path)
+    {
+        if (!req.has_header("X-OC-Mtime")) return;
+
+        const std::string& val = req.get_header_value("X-OC-Mtime");
+        char* end = nullptr;
+        long long secs = std::strtoll(val.c_str(), &end, 10);
+        if (end == val.c_str() || secs < 0) return; // not a valid number
+
+        struct timespec times[2];
+        times[0].tv_sec = 0; times[0].tv_nsec = UTIME_OMIT;        // leave atime
+        times[1].tv_sec = static_cast<time_t>(secs); times[1].tv_nsec = 0; // set mtime
+
+        if (utimensat(AT_FDCWD, path.c_str(), times, 0) == 0)
+        {
+            res.set_header("X-OC-Mtime", "accepted");
+        }
     }
 
     std::string guess_content_type(const fs::path& local_path)
@@ -1479,6 +1504,8 @@ namespace WebDAVServer
                     return;
                 }
 
+                apply_oc_mtime(req, res, req.path);
+
                 res.status = 206;
                 res.set_content("Partial content written.", "text/plain");
                 return;
@@ -1540,6 +1567,9 @@ namespace WebDAVServer
                 res.set_content("Could not finalize upload.", "text/plain");
                 return;
             }
+
+            // Preserve the client's modification time if it sent X-OC-Mtime.
+            apply_oc_mtime(req, res, target_path.string());
 
             // 201 when a new resource was created, 204 when an existing one was
             // overwritten (RFC 4918 9.7.1).
