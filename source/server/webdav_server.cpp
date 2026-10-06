@@ -1461,16 +1461,23 @@ namespace WebDAVServer
 
             const size_t FLUSH_THRESHOLD = 1024 * 1024; // flush accumulator at 1 MB
 
-            // Stream the body directly into the target file (truncating any
-            // existing content). No temp file / rename is used.
-            int fd = open(req.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            // Stream the body into a temp file in the same directory, then
+            // atomically rename over the target. This keeps an existing file
+            // intact if the upload is truncated or aborted mid-stream (e.g. a
+            // botched rclone overwrite): the original is only replaced once a
+            // complete body has been written and renamed into place.
+            fs::path tmp_path = target_path;
+            tmp_path += ".tmp-" + generate_uuid();
+
+            int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (fd < 0)
             {
                 res.status = (errno == ENOENT || errno == ENOTDIR) ? 409 : 500;
                 return;
             }
-            // Set the permission from the file extension (executable payloads get
-            // 0777), applied with fchmod so it's exact regardless of umask.
+            // Set the final permission from the *target* extension (not the temp
+            // name) with fchmod, so the mode is exact regardless of umask and
+            // survives the rename below.
             fchmod(fd, put_create_mode(target_path));
 
             std::vector<char> acc;
@@ -1494,8 +1501,23 @@ namespace WebDAVServer
 
             if (!ok)
             {
+                std::error_code rm_ec;
+                fs::remove(tmp_path, rm_ec); // discard the partial temp file
                 res.status = 500;
                 res.set_content("Write failed.", "text/plain");
+                return;
+            }
+
+            // Atomically replace the target. The existing file is untouched up
+            // to this point, so a failed upload never corrupts it.
+            std::error_code mv_ec;
+            fs::rename(tmp_path, target_path, mv_ec);
+            if (mv_ec)
+            {
+                std::error_code rm_ec;
+                fs::remove(tmp_path, rm_ec);
+                res.status = 500;
+                res.set_content("Could not finalize upload.", "text/plain");
                 return;
             }
 
