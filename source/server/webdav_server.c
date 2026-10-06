@@ -45,8 +45,21 @@
 #include <microhttpd.h>
 
 #include "server/webdav_server.h"
+#ifdef DEBUG
 #include "dbglogger.h"
+#endif
 #include "util.h"
+
+/* Request logging toggle built on the shared DEBUG switch / DBG_LOG (see
+ * util.h). When DEBUG is on LOG_REQUEST() calls log_request(); otherwise it is
+ * a no-op that still casts its arguments to void, so log_request() is never
+ * called yet the args (e.g. logged_status) aren't flagged as unused. */
+#ifdef DEBUG
+#define LOG_REQUEST(conn, method, url, status) log_request((conn), (method), (url), (status))
+#else
+#define LOG_REQUEST(conn, method, url, status) \
+    ((void)(conn), (void)(method), (void)(url), (void)(status))
+#endif
 
 #ifndef APP_VERSION
 #define APP_VERSION 1.00
@@ -1704,6 +1717,7 @@ static int put_feed(request_ctx_t *ctx, const char *data, size_t len)
     {
         while ((off_t)ctx->received > ctx->allocated - (off_t)PUT_FLUSH_THRESHOLD)
         {
+#ifdef DEBUG
             /* Time each reservation so we can tell a true (near-instant) block
              * reservation / fast failure apart from a stalling zero-fill. */
             struct timespec t0, t1;
@@ -1716,14 +1730,18 @@ static int put_feed(request_ctx_t *ctx, const char *data, size_t len)
                 (long long)(t1.tv_sec - t0.tv_sec) * 1000000LL +
                 (t1.tv_nsec - t0.tv_nsec) / 1000LL;
 
-            dbglogger_log("prealloc: offset=%lld chunk=%lld bytes rc=%d elapsed=%lld us (%.3f ms)",
-                          (long long)ctx->allocated, (long long)alloc_chunk, rc,
-                          elapsed_us, (double)elapsed_us / 1000.0);
-
+            DBG_LOG("prealloc: offset=%lld chunk=%lld bytes rc=%d elapsed=%lld us (%.3f ms)",
+                    (long long)ctx->allocated, (long long)alloc_chunk, rc,
+                    elapsed_us, (double)elapsed_us / 1000.0);
+#else
+            int rc = reserve_space(ctx->put_fd, ctx->allocated, alloc_chunk);
+#endif
             if (rc != 0)
             {
-                dbglogger_log("prealloc: disabled for this upload (reserve_space failed, errno=%d: %s)",
-                              saved_errno, strerror(saved_errno));
+#ifdef DEBUG
+                DBG_LOG("prealloc: disabled for this upload (reserve_space failed, errno=%d: %s)",
+                        saved_errno, strerror(saved_errno));
+#endif
                 ctx->allocated = -1;
                 break;
             }
@@ -2259,6 +2277,10 @@ static enum MHD_Result handle_unlock(struct MHD_Connection *conn, const char *re
 /* Request logging                                                   */
 /* ------------------------------------------------------------------ */
 
+/* Request logging. Entirely compiled out of release builds -- the LOG_REQUEST()
+ * macro gates the call sites, so neither these functions nor the work they do
+ * exist unless DEBUG is defined. */
+#ifdef DEBUG
 static enum MHD_Result log_header_cb(void *cls, enum MHD_ValueKind kind,
                                      const char *key, const char *value)
 {
@@ -2281,6 +2303,7 @@ static void log_request(struct MHD_Connection *conn, const char *method,
     dbglogger_log("%s", sb.data ? sb.data : "");
     sb_free(&sb);
 }
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Main access handler                                               */
@@ -2382,7 +2405,7 @@ static enum MHD_Result access_handler(void *cls, struct MHD_Connection *conn,
             MHD_destroy_response(resp);
         }
 
-        log_request(conn, method, url, logged_status);
+        LOG_REQUEST(conn, method, url, logged_status);
         free(local_path);
         return ret;
     }
@@ -2511,7 +2534,7 @@ static enum MHD_Result access_handler(void *cls, struct MHD_Connection *conn,
     }
 
 done:
-    log_request(conn, method, url, logged_status);
+    LOG_REQUEST(conn, method, url, logged_status);
     free(local_path);
     return ret;
 }

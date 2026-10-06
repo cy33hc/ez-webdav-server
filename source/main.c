@@ -17,7 +17,9 @@
 #include <pthread.h>
 
 #include "server/webdav_server.h"
+#ifdef DEBUG
 #include "dbglogger.h"
+#endif
 #include "util.h"
 
 #ifndef PLATFORM_WSL
@@ -81,8 +83,13 @@ int main(int argc, char *argv[])
     (void)argc;
     (void)argv;
 
+    /* Only initialize the debug logger in DEBUG builds; in release builds no
+     * logging is emitted (DBG_LOG compiles to a no-op), so there's no reason to
+     * open the logger socket/file. */
+#ifdef DEBUG
     dbglogger_init();
-    dbglogger_log("If you see this you've set up dbglogger correctly.");
+    DBG_LOG("If you see this you've set up dbglogger correctly.");
+#endif
 
     if (WebDAVServer_IsStarted())
     {

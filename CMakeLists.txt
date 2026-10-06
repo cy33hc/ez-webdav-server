@@ -8,6 +8,11 @@ project(webdav-server)
 #   WSL - Build a native Linux/WSL binary for local testing (no console SDK)
 set(PLATFORM "PS5" CACHE STRING "Target platform (PS4, PS5 or WSL)")
 
+# Debug logging toggle (default OFF). Enable with: cmake -DDEBUG=ON ..
+# When ON, defines DEBUG so DBG_LOG()/log_request() emit via dbglogger; when
+# OFF the logging (and the work that builds it) is compiled out entirely.
+option(DEBUG "Enable debug logging via dbglogger" OFF)
+
 # Base compilation flags shared by every platform
 set(BASE_C_FLAGS "-O3 -Wno-keyword-macro -fPIC -fPIE -Wall -fstack-protector-all")
 
@@ -98,6 +103,7 @@ endif()
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     APP_VERSION=${APP_VERSION}
     ${PLATFORM_DEF}
+    $<$<BOOL:${DEBUG}>:DEBUG>
 )
 
 target_link_libraries(${PROJECT_NAME}
