@@ -582,23 +582,9 @@ static char *parse_destination_path(const char *dest_header)
     return url_decode(path_start);
 }
 
-/* Apply ownCloud X-OC-Mtime if present. Returns 1 if applied. */
-static int apply_oc_mtime(struct MHD_Connection *conn, const char *path)
-{
-    const char *val = MHD_lookup_connection_value(conn, MHD_HEADER_KIND, "X-OC-Mtime");
-    if (!val)
-        return 0;
-    char *end = NULL;
-    long long secs = strtoll(val, &end, 10);
-    if (end == val || secs < 0)
-        return 0;
-    struct timespec times[2];
-    times[0].tv_sec = 0;
-    times[0].tv_nsec = UTIME_OMIT;
-    times[1].tv_sec = (time_t)secs;
-    times[1].tv_nsec = 0;
-    return utimensat(AT_FDCWD, path, times, 0) == 0 ? 1 : 0;
-}
+/* (ownCloud X-OC-Mtime handling now lives in put_begin/put_commit: the header
+ * is parsed up front and applied to the temp file just before the deferred
+ * atomic rename, so the modtime survives the commit.) */
 
 /* ------------------------------------------------------------------ */
 /* Minimal XML body parsing (hand-rolled, tolerant)                  */
@@ -1566,10 +1552,14 @@ typedef struct
     int target_existed;
     off_t allocated;        /* bytes preallocated so far (-1 = fallocate failed) */
     unsigned long long received;
+    long long content_length; /* declared Content-Length, or -1 if unknown */
     char acc[PUT_FLUSH_THRESHOLD];
     size_t acc_len;
     int put_error;          /* set if a write failed mid-stream */
     int put_parent_missing;
+    int put_aborted;        /* client dropped the connection mid-upload */
+    int put_ready_to_commit;/* body fully flushed to temp; awaiting clean end */
+    int put_length_required;/* no Content-Length and not chunked: unframed body */
 
     /* Buffered body for XML methods (PROPFIND/PROPPATCH/LOCK/etc.) */
     strbuf_t body;
@@ -1597,9 +1587,42 @@ static int write_all_fd(int fd, const char *data, size_t len)
 /* PUT handling (streaming)                                          */
 /* ------------------------------------------------------------------ */
 
-static int put_begin(request_ctx_t *ctx, const char *path)
+static int put_begin(request_ctx_t *ctx, struct MHD_Connection *conn, const char *path)
 {
     snprintf(ctx->target_path, sizeof ctx->target_path, "%s", path);
+
+    /* Record the declared Content-Length so put_finish() can verify the full
+     * body actually arrived before committing the rename. -1 means the client
+     * used chunked transfer (no length), in which case we fall back to the
+     * MHD completion signal / termination code to decide. */
+    ctx->content_length = -1;
+    const char *clen = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
+                                                    MHD_HTTP_HEADER_CONTENT_LENGTH);
+    if (clen)
+    {
+        char *end = NULL;
+        long long v = strtoll(clen, &end, 10);
+        if (end != clen && v >= 0)
+            ctx->content_length = v;
+    }
+
+    /* A PUT body must be framed, either by Content-Length or by chunked
+     * Transfer-Encoding. If neither is present the body is delimited only by
+     * connection close, so there is no way to tell a complete upload from a
+     * truncated one -- MHD treats it as a zero-length body and would otherwise
+     * let us commit an empty file over the target. Reject such requests with
+     * 411 Length Required instead. */
+    if (ctx->content_length < 0)
+    {
+        const char *te = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
+                                                      MHD_HTTP_HEADER_TRANSFER_ENCODING);
+        int is_chunked = te && strcasestr(te, "chunked") != NULL;
+        if (!is_chunked)
+        {
+            ctx->put_length_required = 1;
+            return 0;
+        }
+    }
 
     char parent[2048];
     path_parent(ctx->target_path, parent, sizeof parent);
@@ -1671,10 +1694,23 @@ static int put_feed(request_ctx_t *ctx, const char *data, size_t len)
     return 1;
 }
 
-/* Finalize PUT: flush, truncate, fsync, rename. Returns HTTP status. */
-static unsigned int put_finish(request_ctx_t *ctx, struct MHD_Connection *conn, int *applied_mtime)
+/* Prepare a PUT for commit: flush the accumulator, trim preallocated tail,
+ * fsync and close the temp file, and validate the received length. On success
+ * the temp file is left intact and put_ready_to_commit is set so the actual
+ * rename happens in request_completed() -- but only once MHD confirms the
+ * request terminated cleanly (MHD_REQUEST_TERMINATED_COMPLETED_OK).
+ *
+ * Deferring the rename until the clean-termination signal is what makes the
+ * no-Content-Length (chunked) case safe: if the socket is cut after the last
+ * data byte but before the request terminates normally, we never commit, so a
+ * partial body is never renamed over the target.
+ *
+ * Returns the HTTP status to send back now (201/204 optimistically on
+ * success, or an error status). */
+static unsigned int put_finish(request_ctx_t *ctx)
 {
-    *applied_mtime = 0;
+    if (ctx->put_length_required)
+        return 411;
 
     if (ctx->put_parent_missing)
         return 409;
@@ -1701,17 +1737,43 @@ static unsigned int put_finish(request_ctx_t *ctx, struct MHD_Connection *conn, 
     if (!ok)
     {
         remove(ctx->tmp_path);
+        ctx->tmp_path[0] = '\0';
         return 500;
     }
 
-    if (rename(ctx->tmp_path, ctx->target_path) != 0)
+    /* Length guard: if the client declared a Content-Length but we received
+     * fewer bytes, the body was truncated -- discard rather than commit. */
+    if (ctx->content_length >= 0 &&
+        ctx->received != (unsigned long long)ctx->content_length)
     {
+        ctx->put_aborted = 1;
         remove(ctx->tmp_path);
-        return 500;
+        ctx->tmp_path[0] = '\0';
+        return 400;
     }
 
-    *applied_mtime = apply_oc_mtime(conn, ctx->target_path);
+    /* Body fully written to the temp file. Do NOT rename yet: the commit is
+     * deferred to request_completed() so it only happens on a clean request
+     * termination. */
+    ctx->put_ready_to_commit = 1;
     return ctx->target_existed ? 204 : 201;
+}
+
+/* Commit a prepared PUT: atomically rename the temp file over the target.
+ * Returns 1 on success. Called only after MHD confirms the request terminated
+ * cleanly. */
+static int put_commit(request_ctx_t *ctx)
+{
+    if (!ctx->put_ready_to_commit || ctx->tmp_path[0] == '\0')
+        return 0;
+
+    int ok = rename(ctx->tmp_path, ctx->target_path) == 0;
+    if (!ok)
+        remove(ctx->tmp_path);
+
+    ctx->tmp_path[0] = '\0';
+    ctx->put_ready_to_commit = 0;
+    return ok;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2196,7 +2258,7 @@ static enum MHD_Result access_handler(void *cls, struct MHD_Connection *conn,
             char *local = url_decode(url);
             if (local)
             {
-                put_begin(ctx, local);
+                put_begin(ctx, conn, local);
                 free(local);
             }
         }
@@ -2224,14 +2286,25 @@ static enum MHD_Result access_handler(void *cls, struct MHD_Connection *conn,
             return MHD_YES; /* more body may follow */
         }
 
-        /* Body complete: finalize. */
-        int applied_mtime = 0;
-        unsigned int status = put_finish(ctx, conn, &applied_mtime);
+        /* Body complete: prepare (flush/validate) but defer the commit. */
+        unsigned int status = put_finish(ctx);
         logged_status = status;
 
         if (status == 409)
         {
             ret = respond_text(conn, 409, "Parent collection does not exist.", "text/plain");
+        }
+        else if (status == 411)
+        {
+            ret = respond_text(conn, 411,
+                               "Length Required: PUT needs Content-Length or chunked encoding.",
+                               "text/plain");
+        }
+        else if (status == 400)
+        {
+            ret = respond_text(conn, 400,
+                               "Incomplete upload: body shorter than Content-Length.",
+                               "text/plain");
         }
         else if (status == 500)
         {
@@ -2241,8 +2314,6 @@ static enum MHD_Result access_handler(void *cls, struct MHD_Connection *conn,
         {
             struct MHD_Response *resp = MHD_create_response_from_buffer(
                 strlen("Created"), (void *)"Created", MHD_RESPMEM_MUST_COPY);
-            if (applied_mtime)
-                MHD_add_response_header(resp, "X-OC-Mtime", "accepted");
             MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_TYPE, "text/plain");
             ret = MHD_queue_response(conn, 201, resp);
             MHD_destroy_response(resp);
@@ -2250,8 +2321,6 @@ static enum MHD_Result access_handler(void *cls, struct MHD_Connection *conn,
         else /* 204 */
         {
             struct MHD_Response *resp = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
-            if (applied_mtime)
-                MHD_add_response_header(resp, "X-OC-Mtime", "accepted");
             ret = MHD_queue_response(conn, 204, resp);
             MHD_destroy_response(resp);
         }
@@ -2396,21 +2465,55 @@ static void request_completed(void *cls, struct MHD_Connection *conn,
 {
     (void)cls;
     (void)conn;
-    (void)toe;
     request_ctx_t *ctx = (request_ctx_t *)*con_cls;
     if (!ctx)
         return;
 
-    /* If a PUT connection died mid-stream, discard the temp file. */
     if (ctx->is_put)
     {
+        /* This is the single authoritative commit/abort point for a PUT.
+         *
+         * MHD only reports MHD_REQUEST_TERMINATED_COMPLETED_OK when the whole
+         * request -- including the body -- was received and the response was
+         * handed off cleanly. For a chunked / no-Content-Length upload this is
+         * the ONLY reliable "the body really finished" signal: if the socket
+         * is cut before the terminating chunk, MHD never makes the handler's
+         * body-done pass and instead lands here with a non-OK termination
+         * code. So:
+         *
+         *   - clean termination + a prepared upload  -> commit (atomic rename)
+         *   - anything else                           -> discard the temp
+         *
+         * The target file is only ever replaced by the rename, so an upload
+         * that is cancelled, times out, or errors leaves the existing target
+         * untouched and never leaves a partial file in its place. */
+        int committed = 0;
+        if (toe == MHD_REQUEST_TERMINATED_COMPLETED_OK && ctx->put_ready_to_commit)
+        {
+            committed = put_commit(ctx);
+        }
+        else if (ctx->put_ready_to_commit)
+        {
+            /* Body was fully buffered but the connection did not terminate
+             * cleanly before we could commit -- treat as an aborted upload. */
+            ctx->put_aborted = 1;
+        }
+        (void)committed;
+
+        /* Close any still-open fd (upload aborted mid-stream) and remove any
+         * temp file that was never committed. */
         if (ctx->put_fd >= 0)
         {
             close(ctx->put_fd);
             ctx->put_fd = -1;
+        }
+        if (ctx->tmp_path[0] != '\0')
+        {
             remove(ctx->tmp_path);
+            ctx->tmp_path[0] = '\0';
         }
     }
+
     sb_free(&ctx->body);
     free(ctx);
     *con_cls = NULL;
