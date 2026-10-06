@@ -18,7 +18,7 @@ if(PLATFORM STREQUAL "PS4")
 
     # Define PS4-specific libraries to link
     set(PLATFORM_LIBS
-        tinyxml2
+        microhttpd
         SceSystemService
         SceSysCore
         kernel
@@ -33,10 +33,10 @@ elseif(PLATFORM STREQUAL "WSL")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${BASE_C_FLAGS} -march=native")
 
     # Only portable, host-provided libraries are linked here.
-    #   tinyxml2 - XML parsing/serialization (install libtinyxml2-dev)
-    #   pthread  - std::thread / pthread_create used by main.cpp
+    #   microhttpd - embedded HTTP server (install libmicrohttpd-dev)
+    #   pthread    - pthread_create used by main.c (console event thread)
     set(PLATFORM_LIBS
-        tinyxml2
+        microhttpd
         pthread
     )
 
@@ -50,7 +50,7 @@ else()
 
     # Define PS5-specific libraries to link
     set(PLATFORM_LIBS
-        tinyxml2
+        microhttpd
         SceNotification
         SceSystemService
         SceSysCore
@@ -62,8 +62,8 @@ else()
     set(STRIP_TOOL "$ENV{PS5_PAYLOAD_SDK}/bin/prospero-strip")
 endif()
 
-# CXX flags mirror C flags with standard overrides
-set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++20 -gdwarf-2 -O0 -pedantic -pedantic-errors")
+# The project is now pure C. Compile against C11 with debug info.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu11 -gdwarf-2")
 
 set(APP_VERSION "1.00")
 
@@ -71,12 +71,14 @@ include_directories(
   source
 )
 
-# Keep the internal CMake target name simple
+# Keep the internal CMake target name simple.
+# The server is now plain C on libmicrohttpd; the former cpp-httplib sources
+# (httplib.cpp, webdav_server.cpp, main.cpp) are intentionally excluded.
 add_executable(${PROJECT_NAME}
-  source/http/httplib.cpp
-  source/server/webdav_server.cpp
+  source/server/webdav_server.c
+  source/util.c
   source/dbglogger.c
-  source/main.cpp
+  source/main.c
 )
 
 # For native builds the executable has no custom suffix; console payloads use .elf
@@ -92,11 +94,9 @@ else()
     )
 endif()
 
-# Added PLATFORM_DEF so you can use #ifdef PLATFORM_PS5 in your C++ code
-target_compile_definitions(${PROJECT_NAME} PRIVATE 
-    APP_VERSION=${APP_VERSION} 
-    CPPHTTPLIB_THREAD_POOL_COUNT=64 
-    CPPHTTPLIB_NO_ACCEPT4
+# PLATFORM_DEF lets the C sources branch with #ifdef PLATFORM_PS5 / PLATFORM_WSL
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    APP_VERSION=${APP_VERSION}
     ${PLATFORM_DEF}
 )
 

@@ -18,10 +18,7 @@ typedef struct SceSystemServiceEvent {
     uint8_t  data[60];
 } SceSystemServiceEvent;
 
-extern "C"
-{
-    void sceSystemServicePowerTick();
-    int sceSystemServiceReceiveEvent(SceSystemServiceEvent *event);
-}
-    
+void sceSystemServicePowerTick();
+int sceSystemServiceReceiveEvent(SceSystemServiceEvent *event);
+
 #endif
