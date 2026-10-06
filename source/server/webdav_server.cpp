@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <cerrno>
 #include <tinyxml2.h>
 #include "http/httplib.h"
@@ -406,6 +407,24 @@ namespace WebDAVServer
         }
 
         props.push_back(text_prop("D:getetag", compute_etag(local_path, is_dir)));
+
+        // Quota (free/used bytes) from the filesystem backing this path. Windows
+        // Explorer on an rclone mount reads quota-available-bytes to decide
+        // whether a copy fits; without it, it reports "File Too Large". rclone
+        // also surfaces this as the drive's free space. Reported for every
+        // resource (harmless for files; clients query it on collections).
+        {
+            struct statvfs vfs;
+            if (statvfs(local_path.c_str(), &vfs) == 0)
+            {
+                unsigned long long frsize = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
+                unsigned long long avail = static_cast<unsigned long long>(vfs.f_bavail) * frsize;
+                unsigned long long total = static_cast<unsigned long long>(vfs.f_blocks) * frsize;
+                unsigned long long used  = (total >= avail) ? (total - avail) : 0;
+                props.push_back(text_prop("D:quota-available-bytes", std::to_string(avail)));
+                props.push_back(text_prop("D:quota-used-bytes", std::to_string(used)));
+            }
+        }
 
         props.push_back(ResolvedProp{"D:supportedlock", [](tinyxml2::XMLElement* el)
         {
@@ -1575,8 +1594,12 @@ namespace WebDAVServer
             std::vector<char> acc;
             acc.reserve(FLUSH_THRESHOLD);
             unsigned long long received = 0;
+            unsigned long long cb_count = 0;
+            size_t last_len = 0;
             bool ok = content_reader([&](const char* data, size_t len)
             {
+                cb_count++;
+                last_len = len;
                 received += len;
                 acc.insert(acc.end(), data, data + len);
                 if (acc.size() >= FLUSH_THRESHOLD)
@@ -1588,22 +1611,8 @@ namespace WebDAVServer
             });
             if (ok && !acc.empty()) ok = write_all(fd, acc.data(), acc.size());
 
-            // Abort detection for chunked uploads: a chunked body carries no
-            // Content-Length, so the content reader can return "success" even
-            // when the client dropped the connection mid-stream (observed with
-            // rclone retries: a 12 MiB partial read reported as complete). If
-            // the connection was closed by the time the read returned, treat the
-            // upload as incomplete so we never rename a truncated file into place
-            // or answer 2xx for a body the client abandoned.
-            bool conn_closed = req.is_connection_closed && req.is_connection_closed();
-
-            dbglogger_log("PUT fullbody read done path=%s received=%llu reader_ok=%d conn_closed=%d",
-                req.path.c_str(), received, ok ? 1 : 0, conn_closed ? 1 : 0);
-
-            if (ok && conn_closed)
-            {
-                ok = false;
-            }
+            dbglogger_log("PUT fullbody read done path=%s received=%llu reader_ok=%d callbacks=%llu last_len=%zu",
+                req.path.c_str(), received, ok ? 1 : 0, cb_count, last_len);
 
             // fsync BEFORE rename so the data is durable; check both it and close
             // because disk-full/IO errors frequently surface only at flush time.
