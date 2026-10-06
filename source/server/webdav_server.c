@@ -171,6 +171,28 @@ static void sb_free(strbuf_t *sb)
 /* Small string helpers                                              */
 /* ------------------------------------------------------------------ */
 
+/* Case-insensitive substring search. Portable replacement for strcasestr,
+ * which the PS4 SDK declares but does not provide in its stub libraries. */
+static const char *str_casestr(const char *haystack, const char *needle)
+{
+    if (!*needle)
+        return haystack;
+    for (; *haystack; ++haystack)
+    {
+        const char *h = haystack;
+        const char *n = needle;
+        while (*h && *n &&
+               tolower((unsigned char)*h) == tolower((unsigned char)*n))
+        {
+            ++h;
+            ++n;
+        }
+        if (!*n)
+            return haystack;
+    }
+    return NULL;
+}
+
 /* XML-escape text content into the buffer. */
 static void sb_append_xml_escaped(strbuf_t *sb, const char *s)
 {
@@ -1646,7 +1668,7 @@ static int put_begin(request_ctx_t *ctx, struct MHD_Connection *conn, const char
     {
         const char *te = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
                                                       MHD_HTTP_HEADER_TRANSFER_ENCODING);
-        int is_chunked = te && strcasestr(te, "chunked") != NULL;
+        int is_chunked = te && str_casestr(te, "chunked") != NULL;
         if (!is_chunked)
         {
             ctx->put_length_required = 1;
@@ -1689,11 +1711,20 @@ static int put_begin(request_ctx_t *ctx, struct MHD_Connection *conn, const char
  *
  * On FreeBSD (PS5) there is no fallocate(); posix_fallocate() there is a direct
  * syscall that performs real block allocation and does NOT zero-fill, returning
- * an error on unsupported filesystems. So each platform gets allocation without
- * zeroing. */
+ * an error on unsupported filesystems.
+ *
+ * On PS4 neither API is usable -- the libc headers declare posix_fallocate but
+ * the symbol isn't provided by the SDK stub libraries -- so preallocation is
+ * compiled out and reserve_space() always reports "unavailable", which makes
+ * the caller fall back to plain writes. */
 static int reserve_space(int fd, off_t offset, off_t len)
 {
-#if defined(__linux__)
+#if defined(PLATFORM_PS4)
+    (void)fd;
+    (void)offset;
+    (void)len;
+    return -1; /* no (linkable) preallocation API on PS4 */
+#elif defined(__linux__)
     if (fallocate(fd, 0, offset, len) == 0)
         return 0;
     return -1;
@@ -1830,15 +1861,33 @@ static unsigned int put_finish(request_ctx_t *ctx)
     /* Apply the client's requested modification time (X-OC-Mtime) now that the
      * body is complete. Best-effort: failure to set it doesn't fail the PUT.
      * The access handler echoes "X-OC-Mtime: accepted" when put_oc_mtime is
-     * set so rclone (vendor=owncloud) skips a follow-up time-setting request. */
+     * set so rclone (vendor=owncloud) skips a follow-up time-setting request.
+     *
+     * Use utimes() (struct timeval[2]) rather than utimensat()/UTIME_OMIT:
+     * utimes is the common denominator across WSL, PS5 and PS4 (the PS4 libc
+     * headers lack utimensat and UTIME_OMIT). Since utimes can't omit atime, we
+     * read and preserve the current atime, falling back to atime=mtime if the
+     * stat fails. */
     if (ctx->put_oc_mtime)
     {
-        struct timespec times[2];
-        times[0].tv_sec = 0;
-        times[0].tv_nsec = UTIME_OMIT;              /* leave atime unchanged */
-        times[1].tv_sec = (time_t)ctx->put_oc_secs; /* set mtime */
-        times[1].tv_nsec = 0;
-        utimensat(AT_FDCWD, ctx->target_path, times, 0);
+        struct timeval times[2];
+        struct stat cur;
+
+        if (stat(ctx->target_path, &cur) == 0)
+        {
+            times[0].tv_sec = cur.st_atim.tv_sec;             /* preserve atime */
+            times[0].tv_usec = (long)(cur.st_atim.tv_nsec / 1000);
+        }
+        else
+        {
+            times[0].tv_sec = (time_t)ctx->put_oc_secs;
+            times[0].tv_usec = 0;
+        }
+
+        times[1].tv_sec = (time_t)ctx->put_oc_secs;           /* set mtime */
+        times[1].tv_usec = 0;
+
+        utimes(ctx->target_path, times);
     }
 
     /* Body fully written to the target. It is kept only if the request also

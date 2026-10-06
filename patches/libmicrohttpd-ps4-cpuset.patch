@@ -1,0 +1,38 @@
+Fix libmicrohttpd build on the PS4 payload SDK (orbis-clang,
+--host=x86_64-pc-freebsd).
+
+The SDK's libc exports the symbol cpuset_getaffinity(), so configure defines
+HAVE_CPUSET_GETAFFINITY=1. However the SDK provides neither <sys/cpuset.h>
+nor <sys/_cpuset.h> (HAVE_SYS_CPUSET_H and HAVE_SYS__CPUSET_H are both left
+undefined), so the cpuset_t type is never declared. The FreeBSD-style
+cpuset_getaffinity() branch then fails to compile:
+
+    mhd_tool_get_cpu_count.c:199:5: error: unknown type name 'cpuset_t';
+      did you mean 'cpusetid_t'?
+
+Only compile the cpuset_getaffinity() path when the header that actually
+declares cpuset_t is present. When it is not, MHD falls back to the
+sysctl(HW_NCPU) / sysconf(_SC_NPROCESSORS_ONLN) detection methods, both of
+which the PS4 SDK supports.
+
+Apply from the libmicrohttpd source root with:
+    patch -p1 < libmicrohttpd-ps4-cpuset.patch
+or:
+    git apply libmicrohttpd-ps4-cpuset.patch
+
+--- a/src/tools/mhd_tool_get_cpu_count.c
++++ b/src/tools/mhd_tool_get_cpu_count.c
+@@ -192,7 +192,12 @@
+ mhd_tool_get_proc_cpu_count_cpuset_getaffinity_ (void)
+ {
+   int ret = -1;
+-#if defined(HAVE_CPUSET_GETAFFINITY)
++/* The cpuset_t type lives in <sys/cpuset.h> (or <sys/_cpuset.h>). Some
++   toolchains (e.g. the PS4 payload SDK) export cpuset_getaffinity() without
++   providing that header, so guard on the header as well as the function to
++   avoid an "unknown type name 'cpuset_t'" compile error. */
++#if defined(HAVE_CPUSET_GETAFFINITY) \
++  && (defined(HAVE_SYS_CPUSET_H) || defined(HAVE_SYS__CPUSET_H))
+   /* FreeBSD style */
+   if (0 >= ret)
+   {
