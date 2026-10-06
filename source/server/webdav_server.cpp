@@ -1461,22 +1461,16 @@ namespace WebDAVServer
 
             const size_t FLUSH_THRESHOLD = 1024 * 1024; // flush accumulator at 1 MB
 
-            // Stream the whole body into a temp file in the same directory, then
-            // atomically rename over the target. This truncates correctly on
-            // overwrite, never corrupts an existing file on a failed upload, and
-            // avoids leaving partial files behind.
-            fs::path tmp_path = target_path;
-            tmp_path += ".tmp-" + generate_uuid();
-
-            int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            // Stream the body directly into the target file (truncating any
+            // existing content). No temp file / rename is used.
+            int fd = open(req.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (fd < 0)
             {
                 res.status = (errno == ENOENT || errno == ENOTDIR) ? 409 : 500;
                 return;
             }
-            // Set the final permission from the *target* extension (not the
-            // temp name) with fchmod, so the mode is exact regardless of umask
-            // and survives the rename below.
+            // Set the permission from the file extension (executable payloads get
+            // 0777), applied with fchmod so it's exact regardless of umask.
             fchmod(fd, put_create_mode(target_path));
 
             std::vector<char> acc;
@@ -1493,33 +1487,20 @@ namespace WebDAVServer
             });
             if (ok && !acc.empty()) ok = write_all(fd, acc.data(), acc.size());
 
-            // fsync BEFORE rename so the data is durable; check both it and close
-            // because disk-full/IO errors frequently surface only at flush time.
+            // fsync then close; check both because disk-full/IO errors often
+            // surface only at flush time rather than at write().
             if (ok && fsync(fd) != 0) ok = false;
             if (close(fd) != 0) ok = false;
 
             if (!ok)
             {
-                std::error_code rm_ec;
-                fs::remove(tmp_path, rm_ec); // don't leave a partial temp file
                 res.status = 500;
                 res.set_content("Write failed.", "text/plain");
                 return;
             }
 
-            std::error_code mv_ec;
-            fs::rename(tmp_path, target_path, mv_ec);
-            if (mv_ec)
-            {
-                std::error_code rm_ec;
-                fs::remove(tmp_path, rm_ec);
-                res.status = 500;
-                res.set_content("Could not finalize upload.", "text/plain");
-                return;
-            }
-
             // Preserve the client's modification time if it sent X-OC-Mtime.
-            apply_oc_mtime(req, res, target_path.string());
+            apply_oc_mtime(req, res, req.path);
 
             // 201 when a new resource was created, 204 when an existing one was
             // overwritten (RFC 4918 9.7.1).
