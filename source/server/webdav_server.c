@@ -1368,6 +1368,15 @@ static char *build_directory_html(const char *req_path, const char *local_path, 
 /* Response helpers                                                  */
 /* ------------------------------------------------------------------ */
 
+/* Add the NextCloud-emulation headers that make rclone (vendor=nextcloud) and
+ * similar clients take their smarter, less chatty code path. Applied to every
+ * response via the respond_* helpers and the hand-built responses below. */
+static void add_nextcloud_headers(struct MHD_Response *resp)
+{
+    MHD_add_response_header(resp, "X-LFV", "1");
+    MHD_add_response_header(resp, "OC-API-Version", "1.0");
+}
+
 /* Queue a response built from a malloc'd buffer (freed by MHD). */
 static enum MHD_Result respond_buffer(struct MHD_Connection *conn, unsigned int status,
                                       void *buf, size_t len, const char *content_type)
@@ -1381,6 +1390,7 @@ static enum MHD_Result respond_buffer(struct MHD_Connection *conn, unsigned int 
     }
     if (content_type)
         MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_TYPE, content_type);
+    add_nextcloud_headers(resp);
     enum MHD_Result r = MHD_queue_response(conn, status, resp);
     MHD_destroy_response(resp);
     return r;
@@ -1396,6 +1406,7 @@ static enum MHD_Result respond_text(struct MHD_Connection *conn, unsigned int st
         return MHD_NO;
     if (content_type)
         MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_TYPE, content_type);
+    add_nextcloud_headers(resp);
     enum MHD_Result r = MHD_queue_response(conn, status, resp);
     MHD_destroy_response(resp);
     return r;
@@ -1406,6 +1417,7 @@ static enum MHD_Result respond_empty(struct MHD_Connection *conn, unsigned int s
     struct MHD_Response *resp = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
     if (!resp)
         return MHD_NO;
+    add_nextcloud_headers(resp);
     enum MHD_Result r = MHD_queue_response(conn, status, resp);
     MHD_destroy_response(resp);
     return r;
@@ -1536,6 +1548,7 @@ static enum MHD_Result serve_file(struct MHD_Connection *conn, const char *metho
         MHD_add_response_header(resp, MHD_HTTP_HEADER_ACCEPT_RANGES, "bytes");
         MHD_add_response_header(resp, MHD_HTTP_HEADER_ETAG, etag);
         MHD_add_response_header(resp, MHD_HTTP_HEADER_LAST_MODIFIED, lastmod);
+        add_nextcloud_headers(resp);
         enum MHD_Result r = MHD_queue_response(conn, 200, resp);
         MHD_destroy_response(resp);
         return r;
@@ -1582,6 +1595,7 @@ static enum MHD_Result serve_file(struct MHD_Connection *conn, const char *metho
         status = 206;
     }
 
+    add_nextcloud_headers(resp);
     enum MHD_Result r = MHD_queue_response(conn, status, resp);
     MHD_destroy_response(resp);
     return r;
@@ -1925,8 +1939,7 @@ static enum MHD_Result handle_options(struct MHD_Connection *conn)
     MHD_add_response_header(resp, "Allow",
         "GET, HEAD, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, COPY, MOVE, LOCK, UNLOCK");
     MHD_add_response_header(resp, "DAV", "1, 2");
-    MHD_add_response_header(resp, "X-LFV", "1");
-    MHD_add_response_header(resp, "OC-API-Version", "1.0");
+    add_nextcloud_headers(resp);
     enum MHD_Result r = MHD_queue_response(conn, 200, resp);
     MHD_destroy_response(resp);
     return r;
@@ -1994,8 +2007,7 @@ static enum MHD_Result handle_propfind(struct MHD_Connection *conn, const char *
     MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_TYPE, "application/xml; charset=utf-8");
     MHD_add_response_header(resp, "DAV", "1, 2");
     MHD_add_response_header(resp, "Accept-Ranges", "bytes");
-    MHD_add_response_header(resp, "X-LFV", "1");
-    MHD_add_response_header(resp, "OC-API-Version", "1.0");
+    add_nextcloud_headers(resp);
     enum MHD_Result r = MHD_queue_response(conn, 207, resp);
     MHD_destroy_response(resp);
     return r;
@@ -2249,6 +2261,7 @@ static enum MHD_Result handle_lock(struct MHD_Connection *conn, const char *req_
             snprintf(lt, sizeof lt, "<%s>", full_token);
             MHD_add_response_header(resp, "Lock-Token", lt);
             MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_TYPE, "text/xml; charset=utf-8");
+            add_nextcloud_headers(resp);
             enum MHD_Result r = MHD_queue_response(conn, 200, resp);
             MHD_destroy_response(resp);
             return r;
@@ -2304,6 +2317,7 @@ static enum MHD_Result handle_lock(struct MHD_Connection *conn, const char *req_
     snprintf(lt, sizeof lt, "<%s>", full_token);
     MHD_add_response_header(resp, "Lock-Token", lt);
     MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_TYPE, "text/xml; charset=utf-8");
+    add_nextcloud_headers(resp);
     enum MHD_Result r = MHD_queue_response(conn, 200, resp);
     MHD_destroy_response(resp);
     return r;
@@ -2462,6 +2476,7 @@ static enum MHD_Result access_handler(void *cls, struct MHD_Connection *conn,
             MHD_add_response_header(resp, MHD_HTTP_HEADER_CONTENT_TYPE, "text/plain");
             if (ctx->put_oc_mtime)
                 MHD_add_response_header(resp, "X-OC-Mtime", "accepted");
+            add_nextcloud_headers(resp);
             ret = MHD_queue_response(conn, 201, resp);
             MHD_destroy_response(resp);
         }
@@ -2470,6 +2485,7 @@ static enum MHD_Result access_handler(void *cls, struct MHD_Connection *conn,
             struct MHD_Response *resp = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
             if (ctx->put_oc_mtime)
                 MHD_add_response_header(resp, "X-OC-Mtime", "accepted");
+            add_nextcloud_headers(resp);
             ret = MHD_queue_response(conn, 204, resp);
             MHD_destroy_response(resp);
         }
