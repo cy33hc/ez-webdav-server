@@ -10,7 +10,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 #include <cerrno>
 #include <tinyxml2.h>
 #include "http/httplib.h"
@@ -408,22 +407,17 @@ namespace WebDAVServer
 
         props.push_back(text_prop("D:getetag", compute_etag(local_path, is_dir)));
 
-        // Quota (free/used bytes) from the filesystem backing this path. Windows
-        // Explorer on an rclone mount reads quota-available-bytes to decide
-        // whether a copy fits; without it, it reports "File Too Large". rclone
-        // also surfaces this as the drive's free space. Reported for every
-        // resource (harmless for files; clients query it on collections).
+        // Quota (free/used bytes). The WebDAV tree spans multiple physical
+        // mounts (/, /mnt/usb0, /mnt/disc, ...), but Windows Explorer / rclone
+        // check free space against the mount root "/", whose real statvfs would
+        // report the small system partition and wrongly refuse large copies
+        // destined for /mnt/usb0. So we report a fixed, generous quota (1 TB
+        // total, 1 TB free) to make the volume-level space check always pass;
+        // a genuinely full target still fails at PUT time with a real error.
         {
-            struct statvfs vfs;
-            if (statvfs(local_path.c_str(), &vfs) == 0)
-            {
-                unsigned long long frsize = vfs.f_frsize ? vfs.f_frsize : vfs.f_bsize;
-                unsigned long long avail = static_cast<unsigned long long>(vfs.f_bavail) * frsize;
-                unsigned long long total = static_cast<unsigned long long>(vfs.f_blocks) * frsize;
-                unsigned long long used  = (total >= avail) ? (total - avail) : 0;
-                props.push_back(text_prop("D:quota-available-bytes", std::to_string(avail)));
-                props.push_back(text_prop("D:quota-used-bytes", std::to_string(used)));
-            }
+            constexpr unsigned long long ONE_TB = 1024ULL * 1024 * 1024 * 1024;
+            props.push_back(text_prop("D:quota-available-bytes", std::to_string(ONE_TB)));
+            props.push_back(text_prop("D:quota-used-bytes", "0"));
         }
 
         props.push_back(ResolvedProp{"D:supportedlock", [](tinyxml2::XMLElement* el)
