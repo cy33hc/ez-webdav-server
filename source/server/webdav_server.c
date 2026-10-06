@@ -1665,6 +1665,32 @@ static int put_begin(request_ctx_t *ctx, struct MHD_Connection *conn, const char
     return 1;
 }
 
+/* Reserve disk blocks for [offset, offset+len) WITHOUT zeroing the content.
+ * Returns 0 on success, -1 if preallocation isn't available (caller then stops
+ * trying and falls back to plain writes).
+ *
+ * On Linux (WSL) this uses the raw fallocate() syscall with mode 0, which only
+ * marks blocks as reserved/unwritten -- it never zero-fills, and fails fast
+ * with EOPNOTSUPP on filesystems that can't do it (unlike glibc's
+ * posix_fallocate, which would emulate by writing zeros).
+ *
+ * On FreeBSD (PS5) there is no fallocate(); posix_fallocate() there is a direct
+ * syscall that performs real block allocation and does NOT zero-fill, returning
+ * an error on unsupported filesystems. So each platform gets allocation without
+ * zeroing. */
+static int reserve_space(int fd, off_t offset, off_t len)
+{
+#if defined(__linux__)
+    if (fallocate(fd, 0, offset, len) == 0)
+        return 0;
+    return -1;
+#else
+    if (posix_fallocate(fd, offset, len) == 0)
+        return 0;
+    return -1;
+#endif
+}
+
 static int put_feed(request_ctx_t *ctx, const char *data, size_t len)
 {
     if (ctx->put_fd < 0 || ctx->put_error)
@@ -1678,8 +1704,26 @@ static int put_feed(request_ctx_t *ctx, const char *data, size_t len)
     {
         while ((off_t)ctx->received > ctx->allocated - (off_t)PUT_FLUSH_THRESHOLD)
         {
-            if (posix_fallocate(ctx->put_fd, ctx->allocated, alloc_chunk) != 0)
+            /* Time each reservation so we can tell a true (near-instant) block
+             * reservation / fast failure apart from a stalling zero-fill. */
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int rc = reserve_space(ctx->put_fd, ctx->allocated, alloc_chunk);
+            int saved_errno = errno; /* capture before clock_gettime */
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+
+            long long elapsed_us =
+                (long long)(t1.tv_sec - t0.tv_sec) * 1000000LL +
+                (t1.tv_nsec - t0.tv_nsec) / 1000LL;
+
+            dbglogger_log("prealloc: offset=%lld chunk=%lld bytes rc=%d elapsed=%lld us (%.3f ms)",
+                          (long long)ctx->allocated, (long long)alloc_chunk, rc,
+                          elapsed_us, (double)elapsed_us / 1000.0);
+
+            if (rc != 0)
             {
+                dbglogger_log("prealloc: disabled for this upload (reserve_space failed, errno=%d: %s)",
+                              saved_errno, strerror(saved_errno));
                 ctx->allocated = -1;
                 break;
             }
