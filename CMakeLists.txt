@@ -70,7 +70,7 @@ endif()
 # The project is now pure C. Compile against C11 with debug info.
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu11 -gdwarf-2")
 
-set(APP_VERSION "1.00")
+set(APP_VERSION "1.01")
 
 include_directories(
   source
