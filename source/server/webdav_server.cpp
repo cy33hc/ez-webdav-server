@@ -68,6 +68,22 @@ struct WebDavLock
 #define LOCK_TIMEOUT_SECONDS 3600
 #endif
 
+// Size (in bytes) of each disk-space preallocation step during PUT uploads.
+// Larger values reduce filesystem block-map churn / fragmentation on big
+// uploads; set to 0 to disable preallocation entirely. Overridable at compile
+// time via -DPUT_PREALLOC_CHUNK_BYTES=...
+#ifndef PUT_PREALLOC_CHUNK_BYTES
+#define PUT_PREALLOC_CHUNK_BYTES (100ULL * 1024 * 1024) /* 100 MB */
+#endif
+
+// Preallocation only kicks in once an upload grows past this many bytes, so
+// small files are written plainly with no posix_fallocate overhead (important
+// on filesystems that emulate fallocate by zero-filling). Overridable via
+// -DPUT_PREALLOC_MIN_BYTES=...
+#ifndef PUT_PREALLOC_MIN_BYTES
+#define PUT_PREALLOC_MIN_BYTES (50ULL * 1024 * 1024) /* 50 MB */
+#endif
+
 Server *svr;
 int http_server_port = 8880;
 static bool stop_server = false;
@@ -1480,10 +1496,43 @@ namespace WebDAVServer
             // survives the rename below.
             fchmod(fd, put_create_mode(target_path));
 
+            // Preallocate disk space in PUT_PREALLOC_CHUNK_BYTES-sized steps for
+            // large uploads. Growing a multi-GB file one write at a time forces
+            // the filesystem to update block maps/metadata repeatedly and tends
+            // to fragment the file, which is slow (e.g. a 20 GB upload).
+            // posix_fallocate reserves contiguous blocks ahead of the write
+            // position; ftruncate trims the unused tail at the end.
+            //
+            // Preallocation is adaptive: it only engages once the upload grows
+            // past PUT_PREALLOC_MIN_BYTES, so small files (the common case) are
+            // written plainly with no fallocate overhead. A chunk size of 0
+            // disables it entirely.
+            constexpr off_t ALLOC_CHUNK = static_cast<off_t>(PUT_PREALLOC_CHUNK_BYTES);
+            constexpr off_t ALLOC_MIN   = static_cast<off_t>(PUT_PREALLOC_MIN_BYTES);
+            off_t allocated = 0; // 0 = no reservation active yet / disabled
+
             std::vector<char> acc;
             acc.reserve(FLUSH_THRESHOLD);
+            unsigned long long received = 0;
             bool ok = content_reader([&](const char* data, size_t len)
             {
+                received += len;
+
+                // Engage/extend preallocation only for uploads past the minimum
+                // size, keeping at least one chunk reserved ahead of the data.
+                if (ALLOC_CHUNK > 0 && static_cast<off_t>(received) >= ALLOC_MIN)
+                {
+                    while (static_cast<off_t>(received) > allocated - static_cast<off_t>(FLUSH_THRESHOLD))
+                    {
+                        if (posix_fallocate(fd, allocated, ALLOC_CHUNK) != 0)
+                        {
+                            allocated = -1; // mark failed; stop trying
+                            break;
+                        }
+                        allocated += ALLOC_CHUNK;
+                    }
+                }
+
                 acc.insert(acc.end(), data, data + len);
                 if (acc.size() >= FLUSH_THRESHOLD)
                 {
@@ -1493,6 +1542,10 @@ namespace WebDAVServer
                 return true;
             });
             if (ok && !acc.empty()) ok = write_all(fd, acc.data(), acc.size());
+
+            // Cut the file back to the number of bytes actually received,
+            // discarding any unused tail from a preallocated chunk.
+            if (ok && allocated != 0 && ftruncate(fd, static_cast<off_t>(received)) != 0) ok = false;
 
             // fsync then close; check both because disk-full/IO errors often
             // surface only at flush time rather than at write().
