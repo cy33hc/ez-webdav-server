@@ -449,6 +449,19 @@ static const char *path_filename(const char *p)
     return slash ? slash + 1 : p;
 }
 
+/* Strip trailing '/' from a filesystem path, in place. WebDAV clients (notably
+ * the Windows Mini-Redirector) append a trailing slash to collection paths in
+ * both the request-URI and the Destination header, e.g. "/parent/New Folder/".
+ * A trailing slash breaks path_parent() (it would return the directory itself
+ * instead of its parent) and can make rename() fail, so normalize it away.
+ * The root "/" is preserved. */
+static void strip_trailing_slashes(char *p)
+{
+    size_t len = strlen(p);
+    while (len > 1 && p[len - 1] == '/')
+        p[--len] = '\0';
+}
+
 /* Recursively delete. Returns 0 on success; on failure fills fail_path and
  * sets *fail_errno, returning -1. */
 static int delete_recursive_strict(const char *current, char *fail_path, size_t fp_len, int *fail_errno)
@@ -615,7 +628,10 @@ static char *parse_destination_path(const char *dest_header)
         const char *slash = strchr(p + 3, '/');
         path_start = slash ? slash : "/";
     }
-    return url_decode(path_start);
+    char *decoded = url_decode(path_start);
+    if (decoded)
+        strip_trailing_slashes(decoded);
+    return decoded;
 }
 
 
@@ -2383,6 +2399,7 @@ static enum MHD_Result access_handler(void *cls, struct MHD_Connection *conn,
             char *local = url_decode(url);
             if (local)
             {
+                strip_trailing_slashes(local);
                 put_begin(ctx, conn, local);
                 free(local);
             }
@@ -2392,10 +2409,13 @@ static enum MHD_Result access_handler(void *cls, struct MHD_Connection *conn,
 
     request_ctx_t *ctx = (request_ctx_t *)*con_cls;
 
-    /* Decode the URL path to a local filesystem path. */
+    /* Decode the URL path to a local filesystem path. Collection requests from
+     * some clients carry a trailing slash (e.g. "/parent/New Folder/"); strip
+     * it so filesystem calls (stat/rename/parent lookups) behave correctly. */
     char *local_path = url_decode(url);
     if (!local_path)
         return MHD_NO;
+    strip_trailing_slashes(local_path);
 
     enum MHD_Result ret = MHD_NO;
     unsigned int logged_status = 0;
