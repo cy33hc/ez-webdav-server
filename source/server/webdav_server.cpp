@@ -1588,8 +1588,22 @@ namespace WebDAVServer
             });
             if (ok && !acc.empty()) ok = write_all(fd, acc.data(), acc.size());
 
-            dbglogger_log("PUT fullbody read done path=%s received=%llu reader_ok=%d",
-                req.path.c_str(), received, ok ? 1 : 0);
+            // Abort detection for chunked uploads: a chunked body carries no
+            // Content-Length, so the content reader can return "success" even
+            // when the client dropped the connection mid-stream (observed with
+            // rclone retries: a 12 MiB partial read reported as complete). If
+            // the connection was closed by the time the read returned, treat the
+            // upload as incomplete so we never rename a truncated file into place
+            // or answer 2xx for a body the client abandoned.
+            bool conn_closed = req.is_connection_closed && req.is_connection_closed();
+
+            dbglogger_log("PUT fullbody read done path=%s received=%llu reader_ok=%d conn_closed=%d",
+                req.path.c_str(), received, ok ? 1 : 0, conn_closed ? 1 : 0);
+
+            if (ok && conn_closed)
+            {
+                ok = false;
+            }
 
             // fsync BEFORE rename so the data is durable; check both it and close
             // because disk-full/IO errors frequently surface only at flush time.
