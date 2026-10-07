@@ -6,6 +6,7 @@ This is a customized WebDAV Server for the PS4/PS5. It implements Class 1 and fa
 
 ## Why implement a WebDAV Server?
  - On Windows/Linux/MacOS you can mount WebDAV Server onto the laptop/desktop and directly work with the files on the PS4/PS5 as if they are local on the laptop/desktop.
+ - **Actually I realized that rclone can also mount FTP server so this isn't really needed.**
 
 ## How to Start WebDAV
  - On PS5, send the webdav-server-ps5.elf to the elfloader on port 9021
