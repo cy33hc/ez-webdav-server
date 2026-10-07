@@ -80,7 +80,17 @@
 #endif
 
 #define DOWNLOAD_SEGMENTS 4
-#define PUT_FLUSH_THRESHOLD (1024 * 1024) /* 1 MB */
+
+/* Send/receive socket buffer size applied to each accepted client connection.
+ * Larger buffers improve throughput on high-latency / high-bandwidth links
+ * (big file transfers). Overridable at compile time. */
+#ifndef SOCKET_BUFFER_BYTES
+#define SOCKET_BUFFER_BYTES (2 * 1024 * 1024) /* 2 MB */
+#endif
+
+/* PUT upload accumulator flush size. Kept equal to the socket buffer so a full
+ * socket read drains into one disk write without a size mismatch. */
+#define PUT_FLUSH_THRESHOLD SOCKET_BUFFER_BYTES
 
 static int http_server_port = 8880;
 static volatile int stop_server = 0;
@@ -2664,6 +2674,34 @@ static void request_completed(void *cls, struct MHD_Connection *conn,
 /* Server lifecycle                                                  */
 /* ------------------------------------------------------------------ */
 
+/* Fires when a connection starts/ends. On start we grab the accepted client
+ * socket and enlarge its send/receive buffers (and disable Nagle), which
+ * mirrors the socket tuning the former cpp-httplib server applied. Best-effort:
+ * setsockopt failures are ignored so a connection is never rejected over it. */
+static void connection_notifier(void *cls, struct MHD_Connection *connection,
+                                void **socket_context,
+                                enum MHD_ConnectionNotificationCode toe)
+{
+    (void)cls;
+    (void)socket_context;
+
+    if (toe != MHD_CONNECTION_NOTIFY_STARTED)
+        return;
+
+    const union MHD_ConnectionInfo *info =
+        MHD_get_connection_info(connection, MHD_CONNECTION_INFO_CONNECTION_FD);
+    if (!info)
+        return;
+
+    int fd = info->connect_fd;
+    if (fd < 0)
+        return;
+
+    int bufsize = SOCKET_BUFFER_BYTES;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const void *)&bufsize, sizeof bufsize);
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const void *)&bufsize, sizeof bufsize);
+}
+
 static struct MHD_Daemon *start_daemon(void)
 {
     unsigned int flags = MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG;
@@ -2677,6 +2715,7 @@ static struct MHD_Daemon *start_daemon(void)
         NULL, NULL,
         &access_handler, NULL,
         MHD_OPTION_NOTIFY_COMPLETED, &request_completed, NULL,
+        MHD_OPTION_NOTIFY_CONNECTION, &connection_notifier, NULL,
         MHD_OPTION_CONNECTION_TIMEOUT, (unsigned int)120,
         MHD_OPTION_END);
 }
